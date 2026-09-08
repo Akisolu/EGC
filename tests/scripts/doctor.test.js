@@ -21,6 +21,7 @@ const {
   writeInstallState,
 } = require('../../scripts/lib/install-state');
 const { getEGCDir } = require('../../scripts/lib/utils');
+const { shellQuote } = require('../../scripts/lib/doctor-summary');
 
 function createTempDir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -668,10 +669,10 @@ function runTests() {
       assert.ok(result.stdout.includes('1 stray state.db copy'));
       assert.ok(result.stdout.includes(strayPath));
       const consolidateScript = path.join(__dirname, '..', '..', 'scripts', 'maintenance', 'merge-fragmented-state-dbs.js');
-      assert.ok(result.stdout.includes(`node "${consolidateScript}"`), 'must point at the consolidation script by absolute path, runnable from any cwd');
+      assert.ok(result.stdout.includes(`node ${shellQuote(consolidateScript)}`), 'must point at the consolidation script by absolute path, runnable from any cwd');
       const canonicalDb = path.join(homeDir, '.egc', 'egc', 'state.db');
       assert.ok(
-        result.stdout.includes(`node "${consolidateScript}" --canonical "${canonicalDb}" --source "${strayPath}"`),
+        result.stdout.includes(`node ${shellQuote(consolidateScript)} --canonical ${shellQuote(canonicalDb)} --source ${shellQuote(strayPath)}`),
         'the hint must run as pasted: the script exits with its usage text when no --source is given (#1389)'
       );
       assert.ok(result.stdout.includes('with --apply at the end'), 'the person must learn how to turn the dry run into a write');
@@ -706,7 +707,7 @@ function runTests() {
       const hint = result.stdout.split('\n').find(line => line.includes('merge-fragmented-state-dbs.js'));
       assert.ok(hint, 'the consolidation hint must be printed');
       for (const stray of strays) {
-        assert.ok(hint.includes(`--source "${stray}"`), `the hint must carry --source for ${stray}`);
+        assert.ok(hint.includes(`--source ${shellQuote(stray)}`), `the hint must carry --source for ${stray}`);
       }
       assert.strictEqual(hint.split('--source ').length - 1, strays.length, 'one --source per copy, nothing else');
     } finally {
@@ -759,7 +760,7 @@ function runTests() {
       assert.ok(result.stdout.includes('WARNING: the CLI event store landed in a harness directory'));
       assert.ok(result.stdout.includes(misplacedDb));
       assert.ok(
-        result.stdout.includes(`--canonical "${canonicalDb}" --source "${misplacedDb}"`),
+        result.stdout.includes(`--canonical ${shellQuote(canonicalDb)} --source ${shellQuote(misplacedDb)}`),
         'the misplaced store is the source and the shared store the explicit destination, since the default resolution is what misplaced it'
       );
       assert.ok(!result.stdout.includes(`${canonicalDb} (`), 'the canonical ~/.egc store must never be listed as a stray copy');
@@ -854,6 +855,12 @@ function runTests() {
       fs.writeFileSync(path.join(stateDir, 'Projetos--empty.md'), '');
       fs.writeFileSync(path.join(stateDir, 'archive', 'old.md'), '# Project State\narchived copy\n');
       fs.writeFileSync(path.join(stateDir, 'budget-usage.json'), '{}');
+      // A project directory this process cannot list is not a crash and
+      // not a finding (root and privileged containers can still list it).
+      const sealedDir = path.join(stateDir, 'Projetos--sealed-dir');
+      fs.mkdirSync(sealedDir);
+      fs.writeFileSync(path.join(sealedDir, 'main.md'), '# Project State\nhidden\n');
+      if (process.platform !== 'win32') fs.chmodSync(sealedDir, 0o000);
       const plantedTarget = path.join(outside, 'secret.md');
       fs.writeFileSync(plantedTarget, '# not state\n');
       try {
@@ -865,10 +872,16 @@ function runTests() {
 
       const result = run([], { cwd: projectRoot, homeDir });
       assert.strictEqual(result.code, 0, result.stderr);
-      assert.ok(!result.stdout.includes('State files:'), 'nothing plain means no section at all');
-      const json = JSON.parse(run(['--json'], { cwd: projectRoot, homeDir }).stdout);
-      assert.strictEqual(json.plaintextStateFiles, undefined);
+      const canListSealed = (() => { try { fs.readdirSync(sealedDir); return true; } catch { return false; } })();
+      if (canListSealed) {
+        assert.ok(result.stdout.includes('Projetos--sealed-dir'), 'a privileged process lists the sealed directory like any other');
+      } else {
+        assert.ok(!result.stdout.includes('State files:'), 'nothing plain means no section at all');
+        const json = JSON.parse(run(['--json'], { cwd: projectRoot, homeDir }).stdout);
+        assert.strictEqual(json.plaintextStateFiles, undefined);
+      }
     } finally {
+      try { fs.chmodSync(path.join(homeDir, '.egc', 'state', 'Projetos--sealed-dir'), 0o700); } catch { /* already gone */ }
       cleanup(homeDir);
       cleanup(projectRoot);
       cleanup(outside);
