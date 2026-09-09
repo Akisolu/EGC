@@ -290,11 +290,81 @@ function refuseLinkedDestination(destinationPath, targetRoot, { migrate, dryRun 
   }
 }
 
+// Files a target wants removed: written by an earlier EGC install (the
+// target reads them from the previous install-state) and no longer part of
+// the plan. Only a regular file at the recorded path goes; a link or a
+// directory there is not what EGC wrote and is left alone. Directories the
+// removal empties are dropped too, up to the target root.
+function retirePlannedFiles(plan) {
+  const root = plan.targetRoot ? path.resolve(plan.targetRoot) : null;
+  const retired = [];
+  for (const retirement of retirableFiles(plan)) {
+    fs.unlinkSync(retirement.destinationPath);
+    retired.push(retirement);
+    removeEmptyParents(path.dirname(retirement.destinationPath), root);
+  }
+  return retired;
+}
+
+// The retirements of a plan that would actually be removed right now: the
+// same test the apply runs, so a dry run lists exactly what the apply does.
+function retirableFiles(plan) {
+  const root = plan.targetRoot ? path.resolve(plan.targetRoot) : null;
+  const result = [];
+  for (const retirement of Array.isArray(plan.retirements) ? plan.retirements : []) {
+    const filePath = path.resolve(retirement.destinationPath);
+    if (!root || !filePath.startsWith(root + path.sep)) continue;
+    if (!isRetirableFile(filePath, root, retirement.sourcePath)) continue;
+    result.push({ ...retirement, destinationPath: filePath });
+  }
+  return result;
+}
+
 function isSymbolicLink(filePath) {
   try {
     return fs.lstatSync(filePath).isSymbolicLink();
   } catch {
     return false;
+  }
+}
+
+// Whether the file at filePath is the one EGC wrote and may go: a regular
+// file (never a link), reached through no link between the root and it (a
+// linked ancestor would point the unlink outside the root), and, when the
+// source EGC copied is still known, byte-identical to it. A file the person
+// replaced since is theirs, and a file whose source is gone cannot be told
+// apart from one, so both stay.
+function isRetirableFile(filePath, root, sourcePath) {
+  let stat;
+  try {
+    stat = fs.lstatSync(filePath);
+  } catch {
+    return false;
+  }
+  if (!stat.isFile()) return false;
+  for (let dir = path.dirname(filePath); dir !== root && dir.startsWith(root + path.sep); dir = path.dirname(dir)) {
+    if (isSymbolicLink(dir)) return false;
+  }
+  if (!sourcePath) return false;
+  try {
+    const source = fs.statSync(sourcePath);
+    if (!source.isFile()) return false;
+    return fs.readFileSync(sourcePath).equals(fs.readFileSync(filePath));
+  } catch {
+    return false;
+  }
+}
+
+function removeEmptyParents(dirPath, root) {
+  let current = dirPath;
+  while (current !== root && current.startsWith(root + path.sep)) {
+    try {
+      if (fs.readdirSync(current).length > 0) return;
+      fs.rmdirSync(current);
+    } catch {
+      return;
+    }
+    current = path.dirname(current);
   }
 }
 
@@ -421,6 +491,8 @@ function applyInstallPlan(plan, { onWarning, homeDir, dbPath } = {}) {
     writeManagedText(resolvedClaudeHooksPlan.hooksDestinationPath, `${JSON.stringify(resolvedClaudeHooksPlan.resolvedHooksConfig, null, 2)}\n`);
   }
 
+  const retiredFiles = retirePlannedFiles(plan);
+
   writeInstallState(plan.installStatePath, plan.statePreview);
 
 
@@ -444,7 +516,7 @@ function applyInstallPlan(plan, { onWarning, homeDir, dbPath } = {}) {
     },
   });
 
-  const result = { ...plan, applied: true, migratedLegacyLinks };
+  const result = { ...plan, applied: true, migratedLegacyLinks, retiredFiles };
   Object.defineProperty(result, 'syncPromise', {
     value: syncPromise,
     enumerable: false,
@@ -456,6 +528,8 @@ function applyInstallPlan(plan, { onWarning, homeDir, dbPath } = {}) {
 
 module.exports = {
   applyInstallPlan,
+  retirableFiles,
+  retirePlannedFiles,
   checkedDestinations,
   deepMergeJson,
   findLegacyLinks,

@@ -396,6 +396,65 @@ function runTests() {
     }
   })) passed++; else failed++;
 
+  if (test('lists the egc-universal package files an earlier OpenCode install wrote in the dry run and retires them on apply (#1396)', () => {
+    const homeDir = createTempDir('install-apply-home-');
+    const projectDir = createTempDir('install-apply-project-');
+    try {
+      const configDir = path.join(homeDir, '.config', 'opencode');
+      const statePath = path.join(configDir, 'egc', 'install-state.json');
+      const repoRoot = path.join(__dirname, '..', '..');
+      fs.mkdirSync(path.join(configDir, 'tools'), { recursive: true });
+      // The bytes EGC copied there, and one file the person edited since.
+      fs.copyFileSync(path.join(repoRoot, '.opencode', 'tools', 'index.ts'), path.join(configDir, 'tools', 'index.ts'));
+      fs.copyFileSync(path.join(repoRoot, '.opencode', 'package.json'), path.join(configDir, 'package.json'));
+      fs.writeFileSync(path.join(configDir, 'tools', 'run-tests.ts'), 'edited by hand');
+      fs.writeFileSync(path.join(configDir, 'opencode.json'), JSON.stringify({ model: 'mine/model' }));
+      const { createInstallState, writeInstallState } = require('../../scripts/lib/install-state');
+      const previous = [
+        ['.opencode/tools/index.ts', path.join(configDir, 'tools', 'index.ts')],
+        ['.opencode/tools/run-tests.ts', path.join(configDir, 'tools', 'run-tests.ts')],
+        ['.opencode/package.json', path.join(configDir, 'package.json')],
+        ['.opencode/opencode.json', path.join(configDir, 'opencode.json')],
+      ];
+      writeInstallState(statePath, createInstallState({
+        adapter: { id: 'opencode-home' },
+        targetRoot: configDir,
+        installStatePath: statePath,
+        request: { profile: 'minimal', modules: [], legacyLanguages: [], legacyMode: false },
+        resolution: { selectedModules: [], skippedModules: [] },
+        operations: previous.map(([sourceRelativePath, destinationPath]) => ({ kind: 'copy-file', moduleId: 'platform-configs', sourceRelativePath, destinationPath, strategy: 'sync-root-children', ownership: 'managed', scaffoldOnly: false })),
+        source: { repoVersion: require('../../package.json').version, repoCommit: 'abc123', manifestVersion: 1 },
+      }));
+
+      const dryRun = run(['--target', 'opencode', '--profile', 'minimal', '--dry-run', '--allow-undetected'], { cwd: projectDir, homeDir });
+      assert.strictEqual(dryRun.code, 0, dryRun.stderr);
+      assert.ok(dryRun.stdout.includes('Files to retire'), dryRun.stdout);
+      assert.ok(dryRun.stdout.includes(`- ${path.join(configDir, 'tools', 'index.ts')}`));
+      assert.ok(dryRun.stdout.includes(`- ${path.join(configDir, 'package.json')}`));
+      assert.ok(!dryRun.stdout.includes(`- ${path.join(configDir, 'opencode.json')}`), 'opencode.json is never retired');
+      assert.ok(!dryRun.stdout.includes(`- ${path.join(configDir, 'tools', 'run-tests.ts')}`), 'the dry run does not list the file the person edited, because the apply keeps it');
+      const dryJson = run(['--target', 'opencode', '--profile', 'minimal', '--dry-run', '--allow-undetected', '--json'], { cwd: projectDir, homeDir });
+      assert.deepStrictEqual(JSON.parse(dryJson.stdout).plan.retirements.map(entry => entry.destinationPath).sort(), [path.join(configDir, 'package.json'), path.join(configDir, 'tools', 'index.ts')].sort(), 'the JSON dry run lists exactly what the apply removes');
+      assert.ok(fs.existsSync(path.join(configDir, 'tools', 'index.ts')), 'the dry run touches nothing');
+      assert.ok(!dryRun.stdout.includes('.opencode/tools/'), 'the tools are not planned any more');
+      assert.ok(!dryRun.stdout.includes('.opencode/opencode.json'), 'the package opencode.json is not planned any more');
+
+      const applied = run(['--target', 'opencode', '--profile', 'minimal', '--allow-undetected'], { cwd: projectDir, homeDir, env: { EGC_INSTALL_DELEGATED: '1' } });
+      assert.strictEqual(applied.code, 0, applied.stderr);
+      assert.ok(applied.stdout.includes(`retired file: ${path.join(configDir, 'tools', 'index.ts')}`), applied.stdout);
+      assert.ok(!fs.existsSync(path.join(configDir, 'tools', 'index.ts')), 'the file EGC wrote is gone');
+      assert.strictEqual(fs.readFileSync(path.join(configDir, 'tools', 'run-tests.ts'), 'utf8'), 'edited by hand', 'the file the person edited stays');
+      assert.ok(!fs.existsSync(path.join(configDir, 'package.json')));
+      assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(configDir, 'opencode.json'), 'utf8')), { model: 'mine/model' }, 'the person\'s opencode.json is untouched');
+      assert.ok(fs.existsSync(path.join(configDir, 'plugins', 'opencode-egc-plugin.js')), 'the real plugin is installed');
+
+      const again = run(['--target', 'opencode', '--profile', 'minimal', '--allow-undetected', '--json'], { cwd: projectDir, homeDir, env: { EGC_INSTALL_DELEGATED: '1' } });
+      assert.deepStrictEqual(JSON.parse(again.stdout).result.retiredFiles, [], 'nothing left to retire');
+    } finally {
+      cleanup(homeDir);
+      cleanup(projectDir);
+    }
+  })) passed++; else failed++;
   if (process.platform !== 'win32') {
     if (test('lists a June 2026 legacy skill link in the dry run and reports it migrated on apply (#1400)', () => {
       const homeDir = createTempDir('install-apply-home-');
