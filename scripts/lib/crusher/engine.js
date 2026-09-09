@@ -79,12 +79,14 @@ const STACK_FRAME_AT_RE = /^\s*at\s+\S+/i;
 const STACK_FRAME_PY_RE = /^\s*File\s+"[^"]+",\s+line\s+\d+/i;
 const STACK_FRAME_NATIVE_RE = /^\s*#\d+\s+0x[0-9a-f]+/i;
 const STACK_FRAME_CAUSE_RE = /^\s*(Caused by:|\.{3}\s+\d+\s+more)/i;
+const STACK_FRAME_GO_RE = /^\s+\S+\.go:\d+(?::|\s|$)/i;
 
 function isStackFrame(line) {
   return STACK_FRAME_AT_RE.test(line)
     || STACK_FRAME_PY_RE.test(line)
     || STACK_FRAME_NATIVE_RE.test(line)
-    || STACK_FRAME_CAUSE_RE.test(line);
+    || STACK_FRAME_CAUSE_RE.test(line)
+    || STACK_FRAME_GO_RE.test(line);
 }
 
 // Assertion-detail continuation lines: the summary line ("assertion failed",
@@ -111,15 +113,17 @@ function isStackFrame(line) {
 // below), not by shape, since its second line ("> resolved-command") has
 // no shape of its own to exclude.
 const ASSERT_DETAIL_PYTEST_RE = /^\s*[>E]\s+\S/;
-const ASSERT_DETAIL_GO_RE = /^\s+(expected|actual|got|want)\s*:/i;
+const ASSERT_DETAIL_GO_RE = /^\s+(?:[-+]\s+)?(expected|actual|got|want|received)\s*:/i;
 const ASSERT_DETAIL_RUST_RE = /^\s+(left|right)\s*:\s/;
 const ASSERT_DETAIL_CARET_RE = /^\s*\^[\^~]*\s*$/;
+const ASSERT_DETAIL_DIFF_RE = /^\s+[-+]\s+\S/i;
 
 function isAssertionDetail(line) {
   return ASSERT_DETAIL_PYTEST_RE.test(line)
     || ASSERT_DETAIL_GO_RE.test(line)
     || ASSERT_DETAIL_RUST_RE.test(line)
-    || ASSERT_DETAIL_CARET_RE.test(line);
+    || ASSERT_DETAIL_CARET_RE.test(line)
+    || ASSERT_DETAIL_DIFF_RE.test(line);
 }
 
 // npm's own two-line banner -- "> pkg@version script-name" followed by
@@ -304,15 +308,23 @@ function crushGitDiff(output) {
   ].join('\n');
 }
 
+const TEST_SUMMARY_HEADER_RE = /^\s*(Tests|Test Suites|Snapshots|Time|Ran all|passed|failed|\u2715|\u2717|\u2716|FAIL|PASS:?\s*$)/i;
+const TEST_FAIL_MARKER_RE = /^\s*[●❯›]/u;
+const TEST_MOCHA_HEADER_RE = /^\s*\d+\)\s+\S/;
+const TEST_COUNTS_RE = /^\s*\d+ (passed|failed|skipped|pending)/i;
+
 function crushTestRunner(output) {
   const lines = output.split('\n');
   const bannerLineCount = npmScriptBannerLineCount(lines);
   const kept = lines.filter((raw, i) => {
     if (i < bannerLineCount) return false;
     const l = stripAnsi(raw);
+    const trimmed = l.trim();
     return shouldKeepLine(l)
-      || /^\s*(Tests|Test Suites|Snapshots|Time|Ran all|passed|failed|\u2715|\u2717|\u2716|FAIL|PASS:?\s*$)/i.test(l.trim())
-      || /^\s*\d+ (passed|failed|skipped|pending)/i.test(l);
+      || TEST_SUMMARY_HEADER_RE.test(trimmed)
+      || TEST_FAIL_MARKER_RE.test(trimmed)
+      || TEST_MOCHA_HEADER_RE.test(l)
+      || TEST_COUNTS_RE.test(l);
   });
   const summaryTail = lines.slice(-5).filter(l => l.trim());
   const merged = [...new Set([...kept, ...summaryTail])];
