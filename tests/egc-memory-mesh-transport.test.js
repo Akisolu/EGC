@@ -144,6 +144,119 @@ async function main() {
     });
   });
 
+  // A watcher that is created fine and then never reports anything: the
+  // shape of FSEvents on a loaded macOS runner (#1420).
+  const silentWatch = () => ({ on() { return this; }, close() {} });
+
+  await run('the safety-net poll wakes a parked waiter when the watcher stays silent', async () => {
+    await withTempDir(async dir => {
+      const dbPath = path.join(dir, 'state.db');
+      fs.writeFileSync(dbPath, 'db');
+      const transport = mesh.createMeshTransport({ dbPath, watchImpl: silentWatch, pollMs: 40 });
+      try {
+        assert.strictEqual(transport.mode, 'watch', 'the silent watcher counts as a watcher');
+        const wake = transport.waitForChange(3000);
+        fs.appendFileSync(`${dbPath}-wal`, 'append');
+        const started = Date.now();
+        assert.strictEqual(await wake, 'change');
+        assert.ok(Date.now() - started < 2500, 'the poll woke the waiter well before the deadline');
+      } finally {
+        transport.close();
+      }
+    });
+  });
+
+  await run('the safety-net poll runs only while a waiter is parked and never wakes without a write', async () => {
+    await withTempDir(async dir => {
+      const dbPath = path.join(dir, 'state.db');
+      let stats = 0;
+      const statImpl = file => { stats += 1; return fs.statSync(file); };
+      const transport = mesh.createMeshTransport({ dbPath, watchImpl: silentWatch, pollMs: 20, statImpl });
+      try {
+        const baseline = stats;
+        assert.ok(baseline > 0, 'the baseline is sampled at creation');
+        await new Promise(resolve => setTimeout(resolve, 150));
+        assert.strictEqual(stats, baseline, 'no waiter, no poll');
+        assert.strictEqual(await transport.waitForChange(200), 'timeout', 'no write, no wake');
+        const during = stats;
+        assert.ok(during > baseline, 'the poll ran while the waiter was parked');
+        await new Promise(resolve => setTimeout(resolve, 150));
+        assert.strictEqual(stats, during, 'the poll stopped when the last waiter left');
+      } finally {
+        transport.close();
+      }
+    });
+  });
+
+  await run('a write that lands before the waiter parks still wakes it: the baseline moves only on wake', async () => {
+    await withTempDir(async dir => {
+      const dbPath = path.join(dir, 'state.db');
+      fs.writeFileSync(dbPath, 'db');
+      const transport = mesh.createMeshTransport({ dbPath, watchImpl: silentWatch, pollMs: 40 });
+      try {
+        fs.appendFileSync(`${dbPath}-wal`, 'landed between the read and the park');
+        assert.strictEqual(await transport.waitForChange(3000), 'change', 'the first tick sees the older baseline');
+        assert.strictEqual(await transport.waitForChange(200), 'timeout', 'the wake refreshed the baseline: nothing new, no wake');
+      } finally {
+        transport.close();
+      }
+    });
+  });
+
+  await run('a stat failure other than ENOENT wakes once and then stays quiet', async () => {
+    await withTempDir(async dir => {
+      const dbPath = path.join(dir, 'state.db');
+      fs.writeFileSync(dbPath, 'db');
+      let failing = false;
+      const statImpl = file => {
+        if (failing && file.endsWith('-wal')) {
+          const error = new Error('permission denied');
+          error.code = 'EACCES';
+          throw error;
+        }
+        return fs.statSync(file);
+      };
+      const transport = mesh.createMeshTransport({ dbPath, watchImpl: silentWatch, pollMs: 20, statImpl });
+      try {
+        failing = true;
+        assert.strictEqual(await transport.waitForChange(2000), 'change', 'the store became unreadable: one wake');
+        assert.strictEqual(await transport.waitForChange(200), 'timeout', 'the failure is stable: no storm');
+      } finally {
+        transport.close();
+      }
+    });
+  });
+
+  await run('pollMs 0 disables the safety net and leaves the watcher as the only signal', async () => {
+    await withTempDir(async dir => {
+      const dbPath = path.join(dir, 'state.db');
+      const transport = mesh.createMeshTransport({ dbPath, watchImpl: silentWatch, pollMs: 0 });
+      try {
+        const wake = transport.waitForChange(250);
+        fs.appendFileSync(`${dbPath}-wal`, 'append');
+        assert.strictEqual(await wake, 'timeout');
+      } finally {
+        transport.close();
+      }
+    });
+  });
+
+  await run('close() stops the safety-net poll', async () => {
+    await withTempDir(async dir => {
+      const dbPath = path.join(dir, 'state.db');
+      let stats = 0;
+      const statImpl = file => { stats += 1; return fs.statSync(file); };
+      const transport = mesh.createMeshTransport({ dbPath, watchImpl: silentWatch, pollMs: 20, statImpl });
+      const pending = transport.waitForChange(5000);
+      await new Promise(resolve => setTimeout(resolve, 80));
+      transport.close();
+      assert.strictEqual(await pending, 'closed');
+      const afterClose = stats;
+      await new Promise(resolve => setTimeout(resolve, 120));
+      assert.strictEqual(stats, afterClose, 'no stat after close()');
+    });
+  });
+
   const driver = loadSqliteDriver();
   if (!driver) {
     console.log('[SKIP] sqlite driver not resolvable; end-to-end bus delivery not exercised.');
@@ -233,6 +346,34 @@ async function main() {
             clearInterval(heartbeat);
           }
           assert.strictEqual(reason, 'change', 'sqlite write woke the parked waiter');
+          const events = await bus.readEvents(db, { sessionId: 'mesh-b' });
+          assert.strictEqual(events.length, 1);
+          assert.strictEqual(events[0].kind, 'ping');
+        } finally {
+          transport.close();
+          await db.close();
+        }
+      });
+    });
+
+    await run('a parked waiter is woken by one bus write even when the watcher stays silent', async () => {
+      await withTempDir(async dir => {
+        const bus = compileMemoryModule('session-bus', ts);
+        const dbPath = path.join(dir, 'state.db');
+        const db = await driver.open({ filename: dbPath, driver: driver.sqlite3.Database });
+        // The exact CI shape of #1420: a watcher that never reports, a single
+        // write, no heartbeat. The safety-net poll alone must deliver.
+        const transport = mesh.createMeshTransport({ dbPath, watchImpl: silentWatch });
+        try {
+          await db.exec('PRAGMA journal_mode = WAL;');
+          await bus.createSessionBusTables(db);
+          await bus.announce(db, { sessionId: 'mesh-a', projectPath: '/p' });
+          await bus.announce(db, { sessionId: 'mesh-b', projectPath: '/p' });
+          const wake = transport.waitForChange(8000);
+          const started = Date.now();
+          await bus.sendEvent(db, { fromSession: 'mesh-a', toSession: 'mesh-b', kind: 'ping' });
+          assert.strictEqual(await wake, 'change', 'the poll woke the parked waiter');
+          assert.ok(Date.now() - started < 3000, 'within a few poll intervals, not the deadline');
           const events = await bus.readEvents(db, { sessionId: 'mesh-b' });
           assert.strictEqual(events.length, 1);
           assert.strictEqual(events[0].kind, 'ping');
