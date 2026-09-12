@@ -35,7 +35,7 @@ jobs:
             const dirPath = '/tmp/dco-result';
             if (!fs.existsSync(dirPath) || fs.readdirSync(dirPath).length === 0) {
               console.log('No DCO result artifact found. Skipping comment post cleanly.');
-              process.exit(0);
+              return;
             }
 
             // download-artifact extracts a single-file artifact directly
