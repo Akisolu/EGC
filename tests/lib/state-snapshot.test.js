@@ -166,15 +166,29 @@ function runTests() {
     }
   })) passed++; else failed++;
 
-  if (test('the lock timeout names no path: a lock held by a live process is reported by its role only', () => {
+  if (test('the lock timeout names no path and honors a short retry budget: a lock held by a live process is reported by its role only', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'egc-lock-msg-'));
     try {
       const stateFile = path.join(dir, 'state.md');
       fs.writeFileSync(`${stateFile}.merge.lock`, String(process.pid));
+      const startedAt = Date.now();
       assert.throws(
-        () => withStateFileLockSync(stateFile, () => 'never'),
+        () => withStateFileLockSync(stateFile, () => 'never', { retries: 3, retryDelayMs: 5 }),
         error => error.message === 'Timeout acquiring the state file lock: another process holds it'
       );
+      assert.ok(Date.now() - startedAt < 2000, 'a three-retry budget of 5 ms each must not wait for the default 50 x 100 ms');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  })) passed++; else failed++;
+
+  if (test('a null or out-of-range options argument is accepted: the callback runs and the lock is released', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'egc-lock-opts-'));
+    try {
+      const stateFile = path.join(dir, 'state.md');
+      assert.strictEqual(withStateFileLockSync(stateFile, () => 'ran', null), 'ran');
+      assert.strictEqual(withStateFileLockSync(stateFile, () => 'ran again', { retries: 0, retryDelayMs: -1 }), 'ran again');
+      assert.ok(!fs.existsSync(`${stateFile}.merge.lock`), 'the lock file is released after the callback');
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
