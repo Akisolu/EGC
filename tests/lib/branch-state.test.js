@@ -17,6 +17,7 @@ const {
   legacyBranchStateFile,
   resolveStateRead,
   resolveStateWrite,
+  trustedGitPath,
 } = require('../../scripts/lib/branch-state');
 
 const { collectMemoryState } = require('../../scripts/status');
@@ -101,6 +102,58 @@ function runTests() {
   if (test('detectBranch returns the current branch in a git repo', () => {
     const repo = makeGitRepo('feature/auth');
     assert.strictEqual(detectBranch(repo), 'feature/auth');
+  })) passed++; else failed++;
+
+  if (test('trustedGitPath returns the canonical path only under a trusted root with a .git segment', () => {
+    const realTmp = fs.realpathSync.native(os.tmpdir());
+    const under = path.join(realTmp, 'egc-trusted', '.git', 'HEAD');
+    assert.strictEqual(trustedGitPath(path.join(os.tmpdir(), 'egc-trusted', 'sub', '..', '.git', 'HEAD')), under, 'resolved, normalised and canonical');
+    assert.strictEqual(trustedGitPath(path.join(os.tmpdir(), 'egc-trusted', 'HEAD')), null, 'no .git segment');
+    const outside = path.join(path.parse(realTmp).root, 'egc-nowhere', '.git', 'HEAD');
+    assert.strictEqual(trustedGitPath(outside), null, 'outside the home and temp roots');
+    assert.strictEqual(trustedGitPath(path.join(os.tmpdir(), 'egc-trusted', '..', '..', '..', '..', '..', '..', '..', '..', 'egc-nowhere', '.git')), null, 'a traversal that leaves both roots is refused');
+    if (process.platform !== 'win32') {
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), 'egc-trusted-link-'));
+      try {
+        // A link at .git pointing outside both roots: the lexical path looks
+        // inside the temp root, the canonical one does not.
+        fs.symlinkSync(path.parse(realTmp).root, path.join(base, '.git'), 'dir');
+        assert.strictEqual(trustedGitPath(path.join(base, '.git', 'HEAD')), null, 'a link leading outside the roots is refused');
+        // A link that stays inside the temp root is followed and accepted.
+        fs.mkdirSync(path.join(base, 'real', '.git'), { recursive: true });
+        fs.symlinkSync(path.join(base, 'real'), path.join(base, 'alias'), 'dir');
+        assert.strictEqual(trustedGitPath(path.join(base, 'alias', '.git', 'HEAD')), path.join(fs.realpathSync.native(base), 'real', '.git', 'HEAD'), 'a link inside the roots resolves to its canonical target');
+        // A link loop cannot be canonicalised: refused.
+        fs.symlinkSync(path.join(base, 'loop'), path.join(base, 'loop'));
+        assert.strictEqual(trustedGitPath(path.join(base, 'loop', '.git', 'HEAD')), null, 'a link loop is refused');
+        // A dangling link on the way is refused too: its target could be
+        // created or moved later and redirect the read past the check.
+        fs.symlinkSync(path.join(base, 'not-yet'), path.join(base, 'dangling'));
+        assert.strictEqual(trustedGitPath(path.join(base, 'dangling', '.git', 'HEAD')), null, 'a dangling link on the way is refused');
+        // A parent that cannot be inspected: refused, never guessed. Only
+        // asserted where the mode bits actually seal the directory (not as
+        // root, not in a sandbox that overrides them).
+        const sealed = path.join(base, 'sealed');
+        fs.mkdirSync(sealed);
+        fs.chmodSync(sealed, 0o000);
+        try {
+          let sealedForReal = false;
+          try {
+            fs.readdirSync(sealed);
+          } catch (error) {
+            if (error.code !== 'EACCES' && error.code !== 'EPERM') throw error;
+            sealedForReal = true;
+          }
+          if (sealedForReal) {
+            assert.strictEqual(trustedGitPath(path.join(sealed, 'repo', '.git', 'HEAD')), null, 'a path behind a sealed parent is refused');
+          }
+        } finally {
+          fs.chmodSync(sealed, 0o700);
+        }
+      } finally {
+        fs.rmSync(base, { recursive: true, force: true });
+      }
+    }
   })) passed++; else failed++;
 
   if (test('detectBranch returns null outside a git repo', () => {

@@ -30,18 +30,69 @@ function branchStateKey(branch) {
   return `${readablePrefix}--${digest}`;
 }
 
-// Validates a resolved absolute path is within a trusted directory root
-// (home or tmp) and contains '.git' as a path segment. Using startsWith
-// against os.homedir()/os.tmpdir() -- which are untainted system values --
-// satisfies SonarCloud's path-injection sanitization requirement and also
-// prevents traversal to unrelated filesystem locations.
-function isGitRelatedPath(p) {
-  const resolved = path.resolve(p);
-  const home = os.homedir() + path.sep;
-  const tmp = os.tmpdir() + path.sep;
-  const underTrustedRoot = resolved.startsWith(home) || resolved.startsWith(tmp);
-  const hasGitSegment = resolved.split(path.sep).includes('.git');
-  return underTrustedRoot && hasGitSegment;
+// What sits at a path that does not resolve: 'absent' (nothing there, or
+// a parent that is not a directory), 'link' (a link, a dangling one
+// included: never appended lexically, since a target created or moved
+// later would redirect it past the check), or 'unknown' when the path
+// cannot be inspected at all, which the caller treats like a link.
+function unresolvedComponent(p) {
+  try {
+    return fs.lstatSync(p).isSymbolicLink() ? 'link' : 'plain';
+  } catch (error) {
+    return error.code === 'ENOENT' || error.code === 'ENOTDIR' ? 'absent' : 'unknown';
+  }
+}
+
+// The canonical absolute form of a path: links are resolved through the
+// nearest existing ancestor and the rest is appended lexically, so a link
+// planted at .git or above it cannot lead a read outside the trusted roots
+// while the lexical path still looks inside them. A path that cannot be
+// canonicalised (a link loop, a dangling link on the way, a parent that
+// cannot be inspected) is null.
+function canonicalPath(p) {
+  let existing = path.resolve(p);
+  const tail = [];
+  for (;;) {
+    try {
+      const real = fs.realpathSync.native(existing);
+      return tail.length > 0 ? path.join(real, ...tail) : real;
+    } catch (error) {
+      if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') return null;
+    }
+    const component = unresolvedComponent(existing);
+    if (component === 'link' || component === 'unknown') return null;
+    const parent = path.dirname(existing);
+    if (parent === existing) return null;
+    tail.unshift(path.basename(existing));
+    existing = parent;
+  }
+}
+
+function withTrailingSeparator(dir) {
+  return dir.endsWith(path.sep) ? dir : dir + path.sep;
+}
+
+function trustedRoot(dir) {
+  try {
+    return withTrailingSeparator(fs.realpathSync.native(dir));
+  } catch {
+    return withTrailingSeparator(path.resolve(dir));
+  }
+}
+
+// The canonical absolute form of a git path when it sits under a trusted
+// root (the home directory or the temp directory, untainted system values)
+// and carries '.git' as a path segment; null otherwise. The value returned
+// here is the one every read below uses, so a path handed in by a hook
+// payload or a CLI argument never reaches the filesystem unchecked, and a
+// traversal or a link leading to an unrelated location is refused before
+// any read.
+function trustedGitPath(p) {
+  const canonical = canonicalPath(p);
+  if (!canonical) return null;
+  const underTrustedRoot = canonical.startsWith(trustedRoot(os.homedir())) || canonical.startsWith(trustedRoot(os.tmpdir()));
+  const hasGitSegment = canonical.split(path.sep).includes('.git');
+  return underTrustedRoot && hasGitSegment ? canonical : null;
 }
 
 // Branch detection reads .git/HEAD instead of spawning git: no PATH
@@ -61,17 +112,17 @@ function detectBranch(projectPath) {
   try {
     const rawGitDir = findGitDir(projectPath);
     if (!rawGitDir) return null;
-    let gitDir = path.resolve(rawGitDir);
-    if (!isGitRelatedPath(gitDir)) return null;
+    let gitDir = trustedGitPath(rawGitDir);
+    if (!gitDir) return null;
     if (fs.statSync(gitDir).isFile()) {
       // Worktrees and submodules store a pointer file instead of a directory
       const pointer = fs.readFileSync(gitDir, 'utf8').trim();
       if (!pointer.startsWith('gitdir:')) return null;
-      gitDir = path.resolve(path.dirname(gitDir), pointer.slice('gitdir:'.length).trim());
-      if (!isGitRelatedPath(gitDir)) return null;
+      gitDir = trustedGitPath(path.resolve(path.dirname(gitDir), pointer.slice('gitdir:'.length).trim()));
+      if (!gitDir) return null;
     }
-    const headPath = path.resolve(gitDir, 'HEAD');
-    if (!isGitRelatedPath(headPath)) return null;
+    const headPath = trustedGitPath(path.resolve(gitDir, 'HEAD'));
+    if (!headPath) return null;
     const head = fs.readFileSync(headPath, 'utf8').trim();
     const refPrefix = 'ref: refs/heads/';
     // Detached HEAD stores a bare commit hash; treat it as no branch
@@ -141,6 +192,7 @@ module.exports = {
   sanitizeBranchName,
   branchStateKey,
   detectBranch,
+  trustedGitPath,
   flatStateFile,
   branchStateFile,
   legacyBranchStateFile,
