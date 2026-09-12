@@ -274,6 +274,7 @@ async function main() {
       assert.strictEqual(result.status, 1, result.stderr);
       assert.strictEqual(result.stdout, '');
       assert.ok(result.stderr.includes('regular file'), result.stderr);
+      assert.ok(!result.stderr.includes(stateDirFor(home)), 'the message names the file by role, not by path');
       assert.strictEqual(fs.readFileSync(elsewhere, 'utf8'), 'not the memory');
     } finally {
       cleanup(home);
@@ -294,6 +295,8 @@ async function main() {
         assert.strictEqual(result.status, 1, result.stderr);
         assert.strictEqual(result.stdout, '');
         assert.ok(result.stderr.includes('cannot read'), result.stderr);
+        assert.ok(result.stderr.includes('cannot read the state file (EACCES)'), result.stderr);
+        assert.ok(!result.stderr.includes(path.join('.egc', 'state')), 'the message names the file by role and the failure by its code, never the path');
       } finally {
         fs.chmodSync(file, 0o600);
       }
@@ -343,7 +346,8 @@ async function main() {
         const result = run(['--scope', 'global'], home);
         assert.strictEqual(result.status, 1, result.stderr);
         assert.strictEqual(result.stdout, '');
-        assert.ok(result.stderr.includes('cannot inspect'), result.stderr);
+        assert.ok(result.stderr.includes('cannot inspect the state file (EACCES)'), result.stderr);
+        assert.ok(!result.stderr.includes(path.join('.egc', 'global')), 'never the path');
       } finally {
         fs.chmodSync(globalDir, 0o700);
       }
