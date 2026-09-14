@@ -696,6 +696,7 @@ function runTests() {
       const strays = [
         path.join(homeDir, '.gemini', 'egc', 'state.db'),
         path.join(homeDir, '.config', 'opencode', 'egc', 'state.db'),
+        path.join(homeDir, '.codebuddy', 'egc', 'state.db'),
       ];
       for (const stray of strays) {
         fs.mkdirSync(path.dirname(stray), { recursive: true });
@@ -704,7 +705,7 @@ function runTests() {
 
       const result = run([], { cwd: projectRoot, homeDir });
       assert.strictEqual(result.code, 0, result.stderr);
-      assert.ok(result.stdout.includes('2 stray state.db copies'));
+      assert.ok(result.stdout.includes('3 stray state.db copies'));
       const hint = result.stdout.split('\n').find(line => line.includes('merge-fragmented-state-dbs.js'));
       assert.ok(hint, 'the consolidation hint must be printed');
       for (const stray of strays) {
@@ -765,6 +766,33 @@ function runTests() {
         'the misplaced store is the source and the shared store the explicit destination, since the default resolution is what misplaced it'
       );
       assert.ok(!result.stdout.includes(`${canonicalDb} (`), 'the canonical ~/.egc store must never be listed as a stray copy');
+    } finally {
+      cleanup(homeDir);
+      cleanup(projectRoot);
+    }
+  })) passed++; else failed++;
+
+  if (test('keeps the CLI store under .egc when a harness variable is set and lists the harness copy as a stray', () => {
+    const homeDir = createTempDir('doctor-home-');
+    const projectRoot = createTempDir('doctor-project-');
+
+    try {
+      const harnessCopy = path.join(homeDir, '.gemini', 'egc', 'state.db');
+      const canonicalDb = path.join(homeDir, '.egc', 'egc', 'state.db');
+      const memoryDb = path.join(homeDir, '.egc', 'memory', 'state.db');
+      for (const file of [harnessCopy, canonicalDb, memoryDb]) {
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, '');
+      }
+
+      // The variable a Gemini-family tool injects used to route the store
+      // to ~/.gemini; the shared store must stay the live one regardless.
+      const result = run(['--json'], { cwd: projectRoot, homeDir, env: { GEMINI_PROJECT_DIR: projectRoot } });
+      assert.strictEqual(result.code, 0, result.stderr);
+      const parsed = JSON.parse(result.stdout);
+      assert.strictEqual(parsed.stateDb.dbPath, canonicalDb);
+      assert.strictEqual(parsed.stateDb.cliStoreMisplaced, false);
+      assert.deepStrictEqual(parsed.stateDb.fragments.map((fragment) => fragment.path), [harnessCopy]);
     } finally {
       cleanup(homeDir);
       cleanup(projectRoot);

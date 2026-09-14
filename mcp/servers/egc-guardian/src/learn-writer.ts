@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
 import { openCompatDatabase } from './sqlite-compat.js';
+import { resolveStateStoreDbPath } from './state-store-path.js';
 
 const MARKER_START = '<!-- egc:learn:start -->';
 const MARKER_END   = '<!-- egc:learn:end -->';
@@ -35,14 +35,8 @@ export interface LearnResult {
   propagated_to: string[];
 }
 
-function resolveStateDb(): string {
-  const env = process.env.EGC_STATE_DB;
-  if (env) return path.resolve(env);
-  return path.join(os.homedir(), '.gemini', 'egc', 'state.db');
-}
-
 async function loadRecentFailures(projectRoot: string, limit: number): Promise<FailurePattern[]> {
-  const dbPath = resolveStateDb();
+  const dbPath = resolveStateStoreDbPath();
   if (!fs.existsSync(dbPath)) return [];
 
   const db = await openCompatDatabase(dbPath, 'egc-guardian');
