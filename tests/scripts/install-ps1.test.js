@@ -41,6 +41,19 @@ function resolvePowerShellCommand() {
   return null;
 }
 
+function describeFailure(error, elapsedMs) {
+  const timedOut = error.code === 'ETIMEDOUT';
+  const signal = error.signal ?? null;
+  return { 
+    code: error.status ?? null, 
+    stdout: error.stdout || '', 
+    stderr: error.stderr || '', 
+    timedOut, 
+    signal, 
+    elapsedMs 
+  };
+}
+
 function run(powerShellCommand, args = [], options = {}) {
   const env = {
     ...process.env,
@@ -48,6 +61,7 @@ function run(powerShellCommand, args = [], options = {}) {
     USERPROFILE: options.homeDir || process.env.USERPROFILE,
   };
 
+  const startTime = Date.now();
   try {
     const stdout = execFileSync(powerShellCommand, ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', SCRIPT, ...args], {
       cwd: options.cwd,
@@ -63,11 +77,7 @@ function run(powerShellCommand, args = [], options = {}) {
 
     return { code: 0, stdout, stderr: '' };
   } catch (error) {
-    return {
-      code: error.status || 1,
-      stdout: error.stdout || '',
-      stderr: error.stderr || '',
-    };
+    return describeFailure(error, Date.now() - startTime);
   }
 }
 
@@ -267,6 +277,22 @@ function runTests() {
     );
   })) passed++; else failed++;
 
+  if (test('correctly classifies timeouts, signals, and exit codes in describeFailure', () => {
+    const timeoutResult = describeFailure({ code: 'ETIMEDOUT', signal: 'SIGTERM', status: null }, 100);
+    assert.strictEqual(timeoutResult.timedOut, true);
+    assert.strictEqual(timeoutResult.signal, 'SIGTERM');
+
+    const signalResult = describeFailure({ signal: 'SIGKILL', status: null }, 100);
+    assert.strictEqual(signalResult.timedOut, false);
+    assert.strictEqual(signalResult.signal, 'SIGKILL');
+    assert.strictEqual(signalResult.code, null);
+
+    const codeResult = describeFailure({ status: 2 }, 100);
+    assert.strictEqual(codeResult.code, 2);
+    assert.strictEqual(codeResult.timedOut, false);
+    assert.strictEqual(codeResult.signal, null);
+  })) passed++; else failed++;  
+
   if (!powerShellCommand) {
     console.log('  - skipped delegation test; PowerShell is not available in PATH');
   } else if (test('delegates to the Node installer and preserves dry-run output', () => {
@@ -274,11 +300,23 @@ function runTests() {
     const projectDir = createTempDir('install-ps1-project-');
 
     try {
-      const result = run(powerShellCommand, ['--target', 'cursor', '--dry-run', 'typescript'], {
+      const delegate = () => run(powerShellCommand, ['--target', 'cursor', '--dry-run', 'typescript'], {
         cwd: projectDir,
         homeDir,
       });
 
+      let result = delegate()
+
+      if (result.timedOut || result.signal) {
+        const cause = result.timedOut 
+          ? `hit the ${FULL_INSTALL_TIMEOUT_MS} ms budget` 
+          : `received signal ${result.signal}`;
+        console.log(`  - retrying the delegation: the first attempt ${cause} after ${result.elapsedMs} ms`);
+        result = delegate();
+      }
+
+      assert.ok(!result.timedOut, `the PowerShell dry run exceeded FULL_INSTALL_TIMEOUT_MS on the retry as well: ${result.elapsedMs} ms of ${FULL_INSTALL_TIMEOUT_MS} ms`);
+      assert.ok(!result.signal, `the PowerShell dry run was terminated by signal ${result.signal} on the retry after ${result.elapsedMs} ms`);
       assert.strictEqual(result.code, 0, result.stderr);
       assert.ok(result.stdout.includes('Dry-run install plan'));
       assert.ok(!fs.existsSync(path.join(projectDir, '.cursor', 'hooks.json')));
