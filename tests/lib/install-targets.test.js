@@ -4210,6 +4210,80 @@ function runTests() {
     );
   })) passed++; else failed++;
 
+  if (test('kiro adapters plan the Kiro platform assets from the repository .kiro directory at the Kiro root and skip the files other targets keep (retired .kiro/install.sh)', () => {
+    const fs = require('fs');
+    const REPO_ROOT = path.join(__dirname, '..', '..');
+    const { KIRO_PLATFORM_DIRS } = require('../../scripts/lib/kiro-platform-operations');
+    const { getInstallTargetAdapter, listInstallTargetAdapters } = require('../../scripts/lib/install-targets/registry');
+    const modules = [
+      { id: 'platform-configs', paths: ['.kiro', '.cursor', 'mcp-configs', 'scripts/auto-update.js', 'scripts/setup-package-manager.js'] },
+      { id: 'agents-core', paths: ['agents'] },
+    ];
+    for (const adapter of listInstallTargetAdapters().filter(entry => entry.target === 'kiro')) {
+      const input = { repoRoot: REPO_ROOT, projectRoot: '/proj', homeDir: '/home/u', modules };
+      const targetRoot = adapter.resolveRoot(input);
+      const operations = adapter.planOperations(input, adapter);
+      const platform = operations.filter(op => op.moduleId === 'platform-configs');
+      assert.deepStrictEqual(
+        platform.map(op => op.sourceRelativePath).sort(),
+        KIRO_PLATFORM_DIRS.map(dir => `.kiro/${dir}`).sort(),
+        `${adapter.id} plans ${platform.map(op => op.sourceRelativePath).join(', ')}`
+      );
+      for (const op of platform) {
+        assert.strictEqual(path.normalize(op.destinationPath), path.normalize(path.join(targetRoot, op.sourceRelativePath.slice('.kiro/'.length))));
+        assert.ok(fs.existsSync(path.join(REPO_ROOT, op.sourceRelativePath)), `${op.sourceRelativePath} exists in the repository`);
+      }
+      const agents = operations.filter(op => op.moduleId === 'agents-core');
+      assert.strictEqual(agents.length, 1);
+      assert.strictEqual(agents[0].destinationPath, path.join(targetRoot, 'agents'), 'the catalog agents share the Kiro agents directory');
+    }
+    assert.strictEqual(getInstallTargetAdapter('kiro').kind, 'home');
+  })) passed++; else failed++;
+
+  if (test('the .kiro directory is a Kiro platform path: foreign everywhere else, native on Kiro, and the catalog agent of the same name yields to the Kiro-shaped one', () => {
+    const REPO_ROOT = path.join(__dirname, '..', '..');
+    const fs = require('fs');
+    const { isForeignPlatformPath } = require('../../scripts/lib/install-targets/helpers');
+    assert.strictEqual(isForeignPlatformPath('.kiro', 'kiro'), false);
+    assert.strictEqual(isForeignPlatformPath('.kiro/agents', 'cursor'), true);
+    assert.strictEqual(isForeignPlatformPath('.kiro', 'egc'), true);
+    const { createManifestInstallPlan } = require('../../scripts/lib/install-executor');
+    // Real directories: the planner checks every destination against its
+    // root with resolved paths, and a bare '/home/u' has no drive on Windows.
+    const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-platform-home-'));
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-platform-project-'));
+    let materialized;
+    try {
+      materialized = createManifestInstallPlan({ sourceRoot: REPO_ROOT, target: 'kiro', profileId: 'full', homeDir, projectRoot });
+    } finally {
+      fs.rmSync(homeDir, { recursive: true, force: true });
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+    const same = (a, b) => path.normalize(a) === path.normalize(b);
+    const posix = value => String(value).replaceAll('\\', '/');
+    const planner = materialized.operations.filter(op => op.kind === 'copy-file' && same(op.destinationPath, path.join(homeDir, '.kiro', 'agents', 'planner.md')));
+    assert.strictEqual(planner.length, 1, `one planner.md lands: ${planner.map(op => op.sourceRelativePath).join(', ')}`);
+    assert.strictEqual(posix(planner[0].sourceRelativePath), '.kiro/agents/planner.md', 'the Kiro-shaped agent wins over the catalog one (source paths carry the platform separator)');
+    const jsonAgent = materialized.operations.find(op => op.kind === 'copy-file' && same(op.destinationPath, path.join(homeDir, '.kiro', 'agents', 'planner.json')));
+    assert.ok(jsonAgent, 'the Kiro JSON agent lands too');
+    const stray = materialized.operations.filter(op => /(^|\/)\.kiro\/(README\.md|docs\/|skills\/|install\.sh)/.test(posix(op.sourceRelativePath)));
+    assert.deepStrictEqual(stray, [], 'the README, the docs, the hand-curated skills and the retired script stay out');
+    const foreign = materialized.operations.filter(op => /^(mcp-configs|scripts\/auto-update\.js|scripts\/setup-package-manager\.js)/.test(posix(op.sourceRelativePath)));
+    assert.deepStrictEqual(foreign, [], 'files other targets keep on their roots stay out of Kiro');
+  })) passed++; else failed++;
+
+  if (test('the Trae adapter resolves .trae-cn when TRAE_ENV=cn at resolution time, as the retired .trae/install.sh allowed', () => {
+    const trae = require('../../scripts/lib/install-targets/trae-project');
+    const previous = process.env.TRAE_ENV;
+    try {
+      process.env.TRAE_ENV = 'cn';
+      assert.strictEqual(trae.resolveRoot({ projectRoot: '/p' }), path.join('/p', '.trae-cn'));
+      delete process.env.TRAE_ENV;
+      assert.strictEqual(trae.resolveRoot({ projectRoot: '/p' }), path.join('/p', '.trae'), 'the choice follows the environment at resolution time, not at require time');
+    } finally {
+      if (previous === undefined) delete process.env.TRAE_ENV; else process.env.TRAE_ENV = previous;
+    }
+  })) passed++; else failed++;
   console.log(`\nResults: Passed: ${passed}, Failed: ${failed}`);
   process.exit(failed > 0 ? 1 : 0);
 }

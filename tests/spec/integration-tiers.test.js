@@ -3,7 +3,7 @@
  *   - All harnesses are listed, and the list's length matches SUPPORTED_INSTALL_TARGETS
  *   - Public English metadata advertises the same harness count
  *   - Every Tier 1 target named in the doc is in SUPPORTED_INSTALL_TARGETS
- *   - Every Tier 2 harness has a real installer script
+ *   - No tool directory at the repository root carries a per-tool install script (Tier 2 is retired)
  *   - Tier 3 entries reference real injection paths in bootstrap-cognitive.js
  */
 
@@ -45,7 +45,6 @@ const EXPECTED_HARNESSES = [
 ];
 
 const EXPECTED_TIER1_TARGETS = ['egc', 'claude', 'cursor', 'antigravity', 'codex', 'qwen', 'opencode', 'codebuddy', 'windsurf', 'amp', 'copilot', 'zed', 'kiro', 'trae', 'junie', 'goose', 'amazonq', 'openhands', 'aider', 'cline', 'warp'];
-const EXPECTED_TIER2_INSTALLERS = ['.kiro/install.sh', '.trae/install.sh'];
 
 function loadDoc() {
   assert.ok(fs.existsSync(DOC_PATH), `integration-tiers.md must exist at ${DOC_PATH}`);
@@ -135,18 +134,24 @@ function testTier1TargetsMatchSupportedInstallTargets() {
   console.log(`  ✓ SUPPORTED_INSTALL_TARGETS exactly matches Tier 1 list (${EXPECTED_TIER1_TARGETS.length} targets, bidirectional)`);
 }
 
-function testTier2InstallersExist() {
-  const isWindows = process.platform === 'win32';
-  for (const rel of EXPECTED_TIER2_INSTALLERS) {
-    const full = path.join(REPO_ROOT, rel);
-    assert.ok(fs.existsSync(full), `Tier 2 installer ${rel} must exist`);
-    if (!isWindows) {
-      assert.ok(fs.statSync(full).mode & 0o111, `Tier 2 installer ${rel} must be executable`);
-    }
+// The per-tool install scripts (.kiro/install.sh, .trae/install.sh and the
+// CodeBuddy pair) were retired: every asset ships through a Tier 1 adapter.
+// Every tool directory at the repository root is checked, so a script under
+// a new name or extension cannot bring the path back unnoticed.
+function testTier2InstallersRetired() {
+  const scriptName = /^(un)?install\.(sh|bash|zsh|js|mjs|cjs|ps1|cmd|bat|py)$/i;
+  const toolDirs = fs.readdirSync(REPO_ROOT, { withFileTypes: true })
+    .filter(entry => entry.isDirectory() && entry.name.startsWith('.') && entry.name !== '.git')
+    .map(entry => entry.name);
+  for (const required of ['.kiro', '.trae', '.codebuddy']) {
+    assert.ok(toolDirs.includes(required), `${required} is a tool directory of the repository`);
   }
-  console.log(`  ✓ Tier 2 installers exist${isWindows ? '' : ' and are executable'}`);
+  const found = toolDirs.flatMap(dir => fs.readdirSync(path.join(REPO_ROOT, dir))
+    .filter(name => scriptName.test(name))
+    .map(name => `${dir}/${name}`));
+  assert.deepStrictEqual(found, [], `per-tool install scripts were retired and must not come back: ${found.join(', ')}`);
+  console.log(`  ✓ no per-tool install script under ${toolDirs.length} tool directories`);
 }
-
 function testClaudeCodeProtocolInjectionExists() {
   const bootstrapSrc = fs.readFileSync(
     path.join(REPO_ROOT, 'scripts', 'bootstrap-cognitive.js'),
@@ -167,7 +172,7 @@ for (const test of [
   testDocListsAllHarnesses,
   testPublicHarnessCountMatchesRegistry,
   testTier1TargetsMatchSupportedInstallTargets,
-  testTier2InstallersExist,
+  testTier2InstallersRetired,
   testClaudeCodeProtocolInjectionExists,
 ]) {
   try {
