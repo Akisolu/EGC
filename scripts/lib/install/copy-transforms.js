@@ -8,6 +8,7 @@ const fs = require('node:fs');
 // the same result, so a transformed file never reads as drifted or foreign.
 
 const CLAUDE_AGENT_FRONTMATTER_TRANSFORM = 'claude-agent-frontmatter';
+const OPENCODE_AGENT_FRONTMATTER_TRANSFORM = 'opencode-agent-frontmatter';
 
 // Model names Claude Code resolves itself. Anything else in an agent's
 // frontmatter (the catalog's Gemini ids) would be sent to the API as-is and
@@ -107,8 +108,88 @@ function toClaudeAgentFrontmatter(text) {
   return ['---', ...frontmatter, '---', ...parts.body].join('\n');
 }
 
+// OpenCode reads ~/.config/opencode/agents/*.md as its own agent definitions
+// and validates the frontmatter: tools is an object of tool name to boolean,
+// color must be a hex value, a model is a provider/model id. The catalog
+// agent's tools list becomes that object, the Gemini model, the stack and
+// the named color are dropped, and the agent is declared a subagent so
+// OpenCode offers it through @ and the task tool.
+const OPENCODE_DROPPED_KEYS = new Set(['model', 'stack', 'color']);
+
+// OpenCode names its tools in lowercase (read, grep, bash, webfetch); the
+// catalog writes them the way Claude Code does. An MCP tool keeps its name.
+function toOpenCodeToolId(name) {
+  return name.trim().toLowerCase();
+}
+
+// Collects the items of a block-style YAML list that follows a key with no
+// inline value, returning them with the index of the first line after them.
+function collectBlockListItems(lines, start) {
+  const items = [];
+  let index = start;
+  while (index < lines.length) {
+    const item = lines[index].match(/^\s+-\s*(.+?)\s*$/);
+    if (!item) break;
+    items.push(stripQuotes(item[1]));
+    index += 1;
+  }
+  return { items, next: index };
+}
+
+function toOpenCodeToolsBlock(items) {
+  return ['tools:', ...items.map(item => `  ${toOpenCodeToolId(item)}: true`)];
+}
+
+function rewriteOpenCodeAgentFrontmatter(lines) {
+  const output = [];
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    const match = splitFrontmatterLine(line);
+    index += 1;
+    if (!match) {
+      output.push(line);
+      continue;
+    }
+    const { key, value } = match;
+    if (OPENCODE_DROPPED_KEYS.has(key)) {
+      continue;
+    }
+    if (key !== 'tools') {
+      output.push(line);
+      continue;
+    }
+    const flow = parseFlowSequence(value);
+    if (flow) {
+      output.push(...toOpenCodeToolsBlock(flow));
+      continue;
+    }
+    if (value === '') {
+      const block = collectBlockListItems(lines, index);
+      output.push(...toOpenCodeToolsBlock(block.items));
+      index = block.next;
+      continue;
+    }
+    output.push(line);
+  }
+  return output;
+}
+
+function toOpenCodeAgentFrontmatter(text) {
+  const parts = splitFrontmatter(stripByteOrderMark(text));
+  if (!parts) {
+    return text;
+  }
+  const frontmatter = rewriteOpenCodeAgentFrontmatter(parts.frontmatter);
+  if (!frontmatter.some(line => splitFrontmatterLine(line)?.key === 'mode')) {
+    frontmatter.push('mode: subagent');
+  }
+  return ['---', ...frontmatter, '---', ...parts.body].join('\n');
+}
+
 const TRANSFORMS = Object.freeze({
   [CLAUDE_AGENT_FRONTMATTER_TRANSFORM]: content => Buffer.from(toClaudeAgentFrontmatter(content.toString('utf8')), 'utf8'),
+  [OPENCODE_AGENT_FRONTMATTER_TRANSFORM]: content => Buffer.from(toOpenCodeAgentFrontmatter(content.toString('utf8')), 'utf8'),
 });
 
 function transformContent(content, transform) {
@@ -128,7 +209,9 @@ function plannedFileContent(sourcePath, transform) {
 
 module.exports = {
   CLAUDE_AGENT_FRONTMATTER_TRANSFORM,
+  OPENCODE_AGENT_FRONTMATTER_TRANSFORM,
   plannedFileContent,
   toClaudeAgentFrontmatter,
+  toOpenCodeAgentFrontmatter,
   transformContent,
 };

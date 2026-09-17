@@ -1,3 +1,4 @@
+const fs = require('node:fs');
 const path = require('node:path');
 
 const {
@@ -7,6 +8,7 @@ const {
   createRemappedOperation,
   isForeignPlatformPath,
   normalizeRelativePath,
+  planFlatAgentOperations,
   planFlatSkillOperation,
   resolveModulesPlan,
 } = require('./helpers');
@@ -41,36 +43,70 @@ function planClaudeRuleOperations(moduleId, sourceRelativePath, planningInput, t
   });
 }
 
-function withClaudeAgentTransform(operation) {
-  return { ...operation, transform: CLAUDE_AGENT_FRONTMATTER_TRANSFORM };
-}
-
 function planClaudeAgentOperations(adapter, moduleId, sourceRelativePath, planningInput, targetRoot) {
-  const normalized = normalizeRelativePath(sourceRelativePath);
-  if (normalized === 'agents') {
-    return createFlatFileOperations({
-      moduleId,
-      repoRoot: planningInput.repoRoot,
-      sourceRelativePath,
-      destinationDir: path.join(targetRoot, 'agents'),
-    }).map(withClaudeAgentTransform);
-  }
-  return [withClaudeAgentTransform(createRemappedOperation(
-    adapter,
-    moduleId,
-    sourceRelativePath,
-    path.join(targetRoot, 'agents', ...normalized.slice('agents/'.length).split('/')),
-    { strategy: 'preserve-relative-path' }
-  ))];
+  return planFlatAgentOperations(adapter, moduleId, sourceRelativePath, planningInput, targetRoot, CLAUDE_AGENT_FRONTMATTER_TRANSFORM);
 }
 
-function planClaudeModuleOperations(adapter, moduleId, sourceRelativePath, planningInput, targetRoot) {
+// Claude Code turns the files of ~/.claude/commands and the skills into the
+// same slash commands, so a command whose name is also a skill of this plan
+// would be listed twice. The skill is the richer form (the command only
+// points at it), so the command stays out; a plan without that skill keeps
+// the command.
+function skillDirectoriesUnder(directory, depth) {
+  if (!fs.existsSync(directory) || !fs.statSync(directory).isDirectory()) {
+    return [];
+  }
+  if (fs.existsSync(path.join(directory, 'SKILL.md'))) {
+    return [path.basename(directory)];
+  }
+  if (depth === 0) {
+    return [];
+  }
+  return fs.readdirSync(directory, { withFileTypes: true })
+    .filter(entry => entry.isDirectory())
+    .flatMap(entry => skillDirectoriesUnder(path.join(directory, entry.name), depth - 1));
+}
+
+function plannedSkillNames(modules, repoRoot) {
+  const names = new Set();
+  if (!repoRoot) {
+    return names;
+  }
+  for (const module of modules) {
+    for (const sourceRelativePath of Array.isArray(module.paths) ? module.paths : []) {
+      const normalized = normalizeRelativePath(sourceRelativePath);
+      if (normalized !== 'skills' && !normalized.startsWith('skills/')) continue;
+      for (const name of skillDirectoriesUnder(path.join(repoRoot, ...normalized.split('/')), 2)) {
+        names.add(name);
+      }
+    }
+  }
+  return names;
+}
+
+function planClaudeCommandOperations(moduleId, sourceRelativePath, planningInput, targetRoot, shadowed) {
+  return createFlatFileOperations({
+    moduleId,
+    repoRoot: planningInput.repoRoot,
+    sourceRelativePath,
+    destinationDir: path.join(targetRoot, 'commands'),
+    destinationNameTransform: fileName => (shadowed.has(path.basename(fileName, '.md')) ? null : fileName),
+  });
+}
+
+function planClaudeModuleOperations(adapter, moduleId, sourceRelativePath, planningInput, targetRoot, shadowed) {
   const normalized = normalizeRelativePath(sourceRelativePath);
   if (normalized === 'rules') {
     return planClaudeRuleOperations(moduleId, sourceRelativePath, planningInput, targetRoot);
   }
   if (normalized === 'agents' || normalized.startsWith('agents/')) {
     return planClaudeAgentOperations(adapter, moduleId, sourceRelativePath, planningInput, targetRoot);
+  }
+  if (normalized === 'commands') {
+    return planClaudeCommandOperations(moduleId, sourceRelativePath, planningInput, targetRoot, shadowed);
+  }
+  if (normalized.startsWith('commands/') && shadowed.has(path.basename(normalized, '.md'))) {
+    return [];
   }
   return [planFlatSkillOperation(adapter, moduleId, sourceRelativePath, planningInput, targetRoot)];
 }
@@ -214,12 +250,13 @@ module.exports = createInstallTargetAdapter({
   nativeRootRelativePath: '.claude',
   planOperations(input, adapter) {
     const { modules, planningInput, targetRoot } = resolveModulesPlan(input, adapter);
+    const shadowed = plannedSkillNames(modules, planningInput.repoRoot);
 
     const moduleOperations = modules.flatMap(module => {
       const paths = Array.isArray(module.paths) ? module.paths : [];
       return paths
         .filter(p => !isForeignPlatformPath(p, adapter.target) && !isClaudeExcludedPath(p))
-        .flatMap(sourceRelativePath => planClaudeModuleOperations(adapter, module.id, sourceRelativePath, planningInput, targetRoot));
+        .flatMap(sourceRelativePath => planClaudeModuleOperations(adapter, module.id, sourceRelativePath, planningInput, targetRoot, shadowed));
     });
 
     // Deterministic memory loading: every Claude Code install registers the

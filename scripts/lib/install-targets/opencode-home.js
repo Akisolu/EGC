@@ -6,8 +6,10 @@ const {
   createRemappedOperation,
   isForeignPlatformPath,
   normalizeRelativePath,
+  planFlatAgentOperations,
   resolveModulesPlan,
 } = require('./helpers');
+const { OPENCODE_AGENT_FRONTMATTER_TRANSFORM } = require('../install/copy-transforms');
 const {
   BASH_GUARDIAN_HOOK_MODULE_ID,
   createBashGuardianScriptCopyOperations,
@@ -40,6 +42,10 @@ const OPENCODE_PACKAGE_SHIPPED_DIRS = ['commands', 'instructions', 'prompts'];
 // left in place because it is the person's global config now, with whatever
 // they and the MCP registration put in it since.
 const OPENCODE_PACKAGE_KEPT_FILES = new Set(['opencode.json']);
+
+function planOpenCodeAgentOperations(adapter, moduleId, sourceRelativePath, planningInput, targetRoot) {
+  return planFlatAgentOperations(adapter, moduleId, sourceRelativePath, planningInput, targetRoot, OPENCODE_AGENT_FRONTMATTER_TRANSFORM);
+}
 
 function isOpenCodePackagePath(normalizedPath) {
   return normalizedPath === OPENCODE_PACKAGE_ROOT || normalizedPath.startsWith(`${OPENCODE_PACKAGE_ROOT}/`);
@@ -240,6 +246,13 @@ module.exports = createInstallTargetAdapter({
 
         if (isOpenCodePackagePath(normalizedPath)) {
           return createOpenCodePackageOperations(adapter, module.id, sourceRelativePath, planningInput, targetRoot);
+        }
+
+        // OpenCode parses ~/.config/opencode/agents/*.md as its own agents,
+        // with a strict frontmatter; the catalog agents land there in that
+        // shape or the whole configuration is refused.
+        if (normalizedPath === 'agents' || normalizedPath.startsWith('agents/')) {
+          return planOpenCodeAgentOperations(adapter, module.id, sourceRelativePath, planningInput, targetRoot);
         }
 
         return [adapter.createScaffoldOperation(module.id, sourceRelativePath, planningInput)];
