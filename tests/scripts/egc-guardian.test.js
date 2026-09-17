@@ -638,6 +638,29 @@ async function runTests() {
       const emptyHome = fs.mkdtempSync(path.join(os.tmpdir(), 'guardian-routing-empty-'));
       try {
         assert.strictEqual(installedModule.installedComponentSources({ environment: {}, cwd: emptyHome, homeDir: emptyHome }).known, false);
+        const bare = installedModule.installedComponentSources({ environment: { CLAUDE_PROJECT_DIR: emptyHome }, cwd: emptyHome, homeDir: emptyHome });
+        assert.strictEqual(bare.known, true, 'a tool named by the environment with no state at all has nothing installed');
+        assert.strictEqual(bare.sources.size, 0);
+        assert.deepStrictEqual(installedModule.splitByInstallation([{ name: 'github-ops', source: 'skills/devops/github-ops/SKILL.md' }], bare).missing.map(e => e.name), ['github-ops']);
+        // No variable, but the MCP client named itself: another tool's state does not count.
+        const named = installedModule.installedComponentSources({ environment: {}, cwd: emptyHome, homeDir, clientName: 'Windsurf' });
+        assert.strictEqual(named.harnessRoot, path.join(homeDir, '.codeium', 'windsurf'));
+        assert.strictEqual(named.known, true);
+        assert.strictEqual(named.sources.size, 0, 'the Claude state under the same home is not offered to Windsurf');
+        // A project-scoped library of the named tool still counts, from the tool's own project directory.
+        const windsurfProject = path.join(emptyHome, '.windsurf', 'egc-install-state.json');
+        fs.mkdirSync(path.dirname(windsurfProject), { recursive: true });
+        fs.writeFileSync(windsurfProject, JSON.stringify({ operations: [{ kind: 'copy-file', sourceRelativePath: 'agents/planner.md' }] }));
+        const withProject = installedModule.installedComponentSources({ environment: {}, cwd: emptyHome, homeDir, clientName: 'Windsurf' });
+        assert.ok(withProject.sources.has('agents/planner.md'), 'the Windsurf project state under cwd counts');
+        const cursorProject = path.join(emptyHome, '.cursor', 'egc-install-state.json');
+        fs.mkdirSync(path.dirname(cursorProject), { recursive: true });
+        fs.writeFileSync(cursorProject, JSON.stringify({ operations: [{ kind: 'copy-file', sourceRelativePath: 'agents/architect.md' }] }));
+        const cursor = installedModule.installedComponentSources({ environment: {}, cwd: emptyHome, homeDir, clientName: 'cursor-vscode' });
+        assert.strictEqual(cursor.known, true, 'a project-only tool is identified by its client name');
+        assert.ok(cursor.sources.has('agents/architect.md') && !cursor.sources.has('agents/planner.md'), 'and reads its own project state only');
+        assert.deepStrictEqual(installedModule.harnessFromClientName('antigravity-cli', homeDir), { homeRoot: path.join(homeDir, '.gemini'), projectDirs: ['.gemini', '.agents'] });
+        assert.strictEqual(installedModule.harnessFromClientName('some-new-tool', homeDir), null);
       } finally {
         fs.rmSync(emptyHome, { recursive: true, force: true });
       }
