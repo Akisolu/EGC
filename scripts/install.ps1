@@ -339,6 +339,7 @@ if ($hasInstallArgs) {
 # skip is announced.
 $isInteractive = [Environment]::UserInteractive -and -not $env:CI -and -not [Console]::IsInputRedirected
 $installLibrary = $false
+$libraryFailed = $false
 if (-not $DryRun) {
     if ($PromptLibrary -eq $true) {
         $installLibrary = $true
@@ -353,44 +354,14 @@ if (-not $DryRun) {
     }
 }
 if ($installLibrary) {
-    if ((Get-Command gemini -ErrorAction SilentlyContinue) -or (Test-Path (Join-Path $env:USERPROFILE ".gemini"))) {
-        Write-Host "  installing to Gemini / AGY..."
-        node $EgcInstall --target egc --profile full
-    }
-    if ((Get-Command codex -ErrorAction SilentlyContinue) -or (Test-Path (Join-Path $env:USERPROFILE ".codex"))) {
-        Write-Host "  installing to Codex..."
-        node $EgcInstall --target codex --profile full
-    }
-    if ((Get-Command opencode -ErrorAction SilentlyContinue) -or (Test-Path (Join-Path $env:USERPROFILE ".opencode"))) {
-        Write-Host "  installing to OpenCode..."
-        node $EgcInstall --target opencode --profile full
-    }
-    if ((Get-Command kiro -ErrorAction SilentlyContinue) -or (Test-Path (Join-Path $env:USERPROFILE ".kiro"))) {
-        if (Get-Command bash -ErrorAction SilentlyContinue) {
-            Write-Host "  installing to Kiro..."
-            bash (Join-Path $RootDir (Join-Path ".kiro" "install.sh")) ~
-        } else {
-            Write-Host "  note: Kiro detected but bash not available - run manually: bash .kiro/install.sh ~" -ForegroundColor Yellow
-        }
-    }
-    if ((Get-Command trae -ErrorAction SilentlyContinue) -or (Test-Path (Join-Path $env:USERPROFILE ".trae")) -or (Test-Path (Join-Path $env:USERPROFILE ".trae-cn"))) {
-        if (Get-Command bash -ErrorAction SilentlyContinue) {
-            Write-Host "  installing to Trae..."
-            bash (Join-Path $RootDir (Join-Path ".trae" "install.sh")) ~
-        } else {
-            Write-Host "  note: Trae detected but bash not available - run manually: bash .trae/install.sh ~" -ForegroundColor Yellow
-        }
-    }
-    if ((Get-Command codebuddy -ErrorAction SilentlyContinue) -or (Test-Path (Join-Path $env:USERPROFILE ".codebuddy"))) {
-        if (Get-Command bash -ErrorAction SilentlyContinue) {
-            Write-Host "  installing to CodeBuddy..."
-            bash (Join-Path $RootDir (Join-Path ".codebuddy" "install.sh")) ~
-        } else {
-            Write-Host "  note: CodeBuddy detected but bash not available - run manually: bash .codebuddy/install.sh ~" -ForegroundColor Yellow
-        }
-    }
+    # One detection list for every tool, shared with the shell installer:
+    # scripts/lib/install/prompt-library.js applies the full profile to each
+    # detected home target and runs the remaining per-tool shell scripts.
+    node (Join-Path $RootDir (Join-Path "scripts" "install-prompt-library.js"))
+    # A tool that did not get the library is reported at the end and turns
+    # the exit status non-zero, after the engine steps below have all run.
+    if ($LASTEXITCODE -ne 0) { $libraryFailed = $true }
 }
-
 if (-not $DryRun) {
     # MCP auto-registration
     Write-Host "  registering MCP servers..."
@@ -471,4 +442,8 @@ if (-not $DryRun) {
         & node (Join-Path $RootDir "scripts/lib/dashboard-launch-cli.js") $RootDir
     }
     Write-Host "Re-check anytime with 'egc doctor'."
+    if ($libraryFailed) {
+        Write-Host "  prompt library: one or more detected tools did not get it (see the notes above)." -ForegroundColor Yellow
+        exit 1
+    }
 }

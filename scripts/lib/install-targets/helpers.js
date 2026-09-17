@@ -20,12 +20,27 @@ function normalizeRelativePath(relativePath) {
     .replace(/\/+$/, ''); // NOSONAR: superlinear risk accepted: input is repo-owned or local state content, never network-controlled
 }
 
+// Paths that carry a platform identity rather than library content. Every
+// target that takes agents-core receives agents/; only the ones listed here
+// also take the Codex and Antigravity .agents tree and the root AGENTS.md,
+// so a home root such as ~/.amp or ~/.claude never grows either.
+const IDENTITY_SOURCE_PATH_OWNERS = Object.freeze({
+  '.agents': Object.freeze(['egc', 'cursor', 'antigravity', 'codex', 'codebuddy', 'zed']),
+  'AGENTS.md': Object.freeze(['egc', 'cursor', 'antigravity', 'codex', 'codebuddy', 'zed']),
+});
+
 function isForeignPlatformPath(sourceRelativePath, adapterTarget) {
   const normalizedPath = normalizeRelativePath(sourceRelativePath);
 
   for (const [prefix, ownerTarget] of Object.entries(PLATFORM_SOURCE_PATH_OWNERS)) {
     if (normalizedPath === prefix || normalizedPath.startsWith(`${prefix}/`)) {
       return ownerTarget !== adapterTarget;
+    }
+  }
+
+  for (const [prefix, owners] of Object.entries(IDENTITY_SOURCE_PATH_OWNERS)) {
+    if (normalizedPath === prefix || normalizedPath.startsWith(`${prefix}/`)) {
+      return !owners.includes(adapterTarget);
     }
   }
 
@@ -561,16 +576,22 @@ function planGenericRetirements(input, adapter) {
     const source = normalizeRelativePath(String(operation.sourceRelativePath || ''));
     if (!source) continue;
     boundaries.seen.add(resolved);
-    retirements.push({
-      destinationPath: resolved,
-      sourceRelativePath: source,
-      // The file EGC copied there, for the apply to compare against: a
-      // file the person replaced since is theirs and stays.
-      sourcePath: path.join(repoRoot, ...source.split('/')),
-      reason: 'file left the install plan',
-    });
+    retirements.push(retirementOf(operation, resolved, source, repoRoot));
   }
   return retirements;
+}
+
+// The file EGC copied there, for the apply to compare against: a file the
+// person replaced since is theirs and stays. A transformed copy is compared
+// against the transformed source.
+function retirementOf(operation, destinationPath, source, repoRoot) {
+  return {
+    destinationPath,
+    sourceRelativePath: source,
+    sourcePath: path.join(repoRoot, ...source.split('/')),
+    ...(operation.transform ? { transform: operation.transform } : {}),
+    reason: 'file left the install plan',
+  };
 }
 
 function createInstallTargetAdapter(config) {

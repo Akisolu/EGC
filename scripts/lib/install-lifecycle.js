@@ -176,19 +176,33 @@ function areFilesEqual(leftPath, rightPath) {
       return false;
     }
 
-    const left = fs.readFileSync(leftPath);
-    const right = fs.readFileSync(rightPath);
-    if (left.equals(right)) {
-      return true;
-    }
+    return areBuffersEqual(fs.readFileSync(leftPath), fs.readFileSync(rightPath));
+  } catch (_error) { // NOSONAR: unreadable files are treated as different
+    return false;
+  }
+}
 
-    // A byte mismatch that disappears once CRLF/LF are normalized is a
-    // line-ending artifact of the install pipeline (e.g. Windows
-    // core.autocrlf rewriting the repo's LF source on checkout, or a
-    // rewrite step like buildResolvedClaudeHooks() that always emits LF via
-    // JSON.stringify), not a real edit to the managed file -- never flag it
-    // as drift.
-    return left.toString('utf8').replaceAll('\r\n', '\n') === right.toString('utf8').replaceAll('\r\n', '\n');
+// A byte mismatch that disappears once CRLF/LF are normalized is a
+// line-ending artifact of the install pipeline (e.g. Windows core.autocrlf
+// rewriting the repo's LF source on checkout, or a rewrite step like
+// buildResolvedClaudeHooks() that always emits LF via JSON.stringify), not
+// a real edit to the managed file -- never flag it as drift.
+function areBuffersEqual(left, right) {
+  if (left.equals(right)) {
+    return true;
+  }
+  return left.toString('utf8').replaceAll('\r\n', '\n') === right.toString('utf8').replaceAll('\r\n', '\n');
+}
+
+// The destination of a transformed copy is compared against the transformed
+// source, with the same guards as areFilesEqual: a destination that became a
+// directory or cannot be read is drift, not a crash of the doctor.
+function areFilesEqualAfterTransform(sourcePath, destinationPath, transform) {
+  try {
+    if (!fs.statSync(destinationPath).isFile()) {
+      return false;
+    }
+    return areBuffersEqual(plannedFileContent(sourcePath, transform), fs.readFileSync(destinationPath));
   } catch (_error) { // NOSONAR: unreadable files are treated as different
     return false;
   }
@@ -361,6 +375,9 @@ function deepRemoveJsonSubset(currentValue, managedValue) {
   return currentValue === managedValue ? JSON_REMOVE_SENTINEL : currentValue;
 }
 
+const { plannedFileContent } = require('./install/copy-transforms');
+const { shellQuote } = require('./doctor-summary');
+
 function hydrateRecordedOperations(repoRoot, operations) {
   return operations.map(operation => {
     if (operation.kind !== 'copy-file') {
@@ -404,6 +421,14 @@ function repairCopyFile(repoRoot, operation) {
     const text = fs.readFileSync(sourcePath, 'utf8');
     assertSafeMcpConfig(parseMcpConfigText(text, sourcePath), sourcePath);
     writeTextKeepingMode(operation.destinationPath, text, sourcePath);
+    return;
+  }
+  if (operation.transform) {
+    writeTextKeepingMode(
+      operation.destinationPath,
+      plannedFileContent(sourcePath, operation.transform).toString('utf8'),
+      sourcePath
+    );
     return;
   }
   copyFileKeepingMode(sourcePath, operation.destinationPath);
@@ -633,7 +658,10 @@ function inspectCopyFileOperation(repoRoot, operation, destinationPath) {
   if (!sourcePath || !fs.existsSync(sourcePath)) {
     return inspectResult('missing-source', operation, destinationPath, { sourcePath });
   }
-  if (!areFilesEqual(sourcePath, destinationPath)) {
+  const equal = operation.transform
+    ? areFilesEqualAfterTransform(sourcePath, destinationPath, operation.transform)
+    : areFilesEqual(sourcePath, destinationPath);
+  if (!equal) {
     return inspectResult('drifted', operation, destinationPath, { sourcePath });
   }
   return inspectResult('ok', operation, destinationPath, { sourcePath });
@@ -975,6 +1003,31 @@ function checkTargetRootHealth(state, record) {
   return issues;
 }
 
+// A profile that resolved to no module at all left the tool with the engine
+// only, whatever the profile promised. Doctor used to call that healthy.
+function checkProfileSelection(state, record) {
+  const profile = state.request ? state.request.profile : null;
+  const selectedModules = state.resolution && Array.isArray(state.resolution.selectedModules)
+    ? state.resolution.selectedModules
+    : [];
+  if (!profile || selectedModules.length > 0) {
+    return [];
+  }
+
+  const target = record.adapter.target;
+  return [buildIssue(
+    'warning',
+    'profile-selected-nothing',
+    `Profile ${profile} selected no module for ${target}, so the tool has the engine only. Run egc install --target ${shellQuote(target)} --profile ${shellQuote(profile)} with this version to install what the profile names`,
+    {
+      profile,
+      skippedModules: state.resolution && Array.isArray(state.resolution.skippedModules)
+        ? [...state.resolution.skippedModules]
+        : [],
+    }
+  )];
+}
+
 function checkManagedOperationHealth(state, context) {
   const issues = [];
   const managedOperations = getManagedOperations(state);
@@ -1114,6 +1167,7 @@ function analyzeRecord(record, context) {
 
   const issues = [
     ...checkTargetRootHealth(state, record),
+    ...checkProfileSelection(state, record),
     ...checkManagedOperationHealth(state, context),
     ...checkVersionDrift(state, context),
     ...checkResolutionDrift(record, state, context),
