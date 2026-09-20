@@ -263,15 +263,10 @@ function skipWrapperOptions(words, start, wrapper, state) {
   return index + wrapper.positionals;
 }
 
-// The operands of the interpreter in a segment, after env assignments and
-// the wrappers above, with the directory they are resolved against. A
-// variable-expanded interpreter cannot be resolved, so its operands are
-// inspected as if it were a shell. After `--` every word is an operand.
-function interpreterOperands(words) {
-  const state = { cwd: null, chroot: null, unsure: false };
-  const found = (operands) => ({ operands, cwd: state.cwd, chroot: state.chroot, unsure: state.unsure });
-
-
+// The index of the first word that is neither an environment assignment
+// nor a wrapper with its options; a chdir or chroot a wrapper carries is
+// noted on `state` for a caller that resolves operands against it.
+function skipEnvAndWrappers(words, state = { cwd: null, chroot: null, unsure: false }) {
   let index = 0;
   while (index < words.length) {
     const word = words[index].value;
@@ -283,6 +278,19 @@ function interpreterOperands(words) {
     if (!wrapper) break;
     index = skipWrapperOptions(words, index + 1, wrapper, state);
   }
+  return index;
+}
+
+// The operands of the interpreter in a segment, after env assignments and
+// the wrappers above, with the directory they are resolved against. A
+// variable-expanded interpreter cannot be resolved, so its operands are
+// inspected as if it were a shell. After `--` every word is an operand.
+function interpreterOperands(words) {
+  const state = { cwd: null, chroot: null, unsure: false };
+  const found = (operands) => ({ operands, cwd: state.cwd, chroot: state.chroot, unsure: state.unsure });
+
+
+  const index = skipEnvAndWrappers(words, state);
   const head = words[index];
   if (!head) return found([]);
 
@@ -484,17 +492,7 @@ function splitHeredoc(segment) {
 // peels: `sudo bash <<EOF` reads the body exactly as `bash <<EOF` does.
 function readsItsInputAsCode(line) {
   const words = shellWords(line);
-  let index = 0;
-  while (index < words.length) {
-    const word = words[index].value;
-    if (/^[A-Za-z_]\w*=/.test(word)) {
-      index += 1;
-      continue;
-    }
-    const wrapper = WRAPPER_SPECS[word.split(/[\\/]/).pop()];
-    if (!wrapper) break;
-    index = skipWrapperOptions(words, index + 1, wrapper, { cwd: null, chroot: null, unsure: false });
-  }
+  const index = skipEnvAndWrappers(words);
   const head = words[index];
   if (!head) return false;
   const isShell = head.value.startsWith('$') || SHELL_INTERPRETERS.has(head.value.split(/[\\/]/).pop().toLowerCase());
@@ -523,7 +521,37 @@ function readsItsInputAsCode(line) {
   return true;
 }
 
+// `egc run --shell` joins the words after its options and hands them to a
+// shell, so a whole script can arrive as one quoted token. The validator
+// judges that token as one command and calls its metacharacters advisory,
+// which is exactly where a compound script would hide a refused command.
+// The script is read as the command line it is: its segments are extracted
+// and validated like the body of a heredoc a shell reads.
+// `egc run --shell` joins the words after its one option and hands them to a
+// shell, so a whole script can arrive as one quoted token. The validator
+// judges that token as one command and calls its metacharacters advisory,
+// which is exactly where a compound script would hide a refused command.
+// The script is read as the command line it is, heredocs included: its
+// segments are extracted and validated like the body of a heredoc a shell
+// reads. `egc run` reads a single option, and only as its first argument
+// (scripts/crush-run.js), so `--shell` first and then the script, whatever
+// it starts with.
+function egcShellScriptOf(segment) {
+  const words = shellWords(segment);
+  const index = skipEnvAndWrappers(words);
+  if (words[index]?.value.split(/[\\/]/).pop() !== 'egc') return null;
+  if (words[index + 1]?.value !== 'run' || words[index + 2]?.value !== '--shell') return null;
+  const script = words.slice(index + 3);
+  if (script.length === 0) return null;
+  // The rewrite hook hands the whole script as one quoted word, which keeps
+  // its line breaks; typed as bare words, the text after --shell is the
+  // script, a heredoc fed to it included. Neither loses what the shell reads.
+  if (script.length === 1) return script[0].value;
+  return segment.slice(words[index + 2].end).replace(/^\s+/, '');
+}
+
 function extractSegments(rawCommand, depth = 0) {
+
   const command = joinContinuations(String(rawCommand));
 
   const bodies = extractSubstitutionBodies(command);
@@ -535,6 +563,19 @@ function extractSegments(rawCommand, depth = 0) {
 
   const topLevel = [];
   for (const raw of splitShellSegments(command, { splitOnPipe: true })) {
+    // A script handed to `egc run --shell` runs in a shell of its own, so
+    // it is read whole and its segments are judged like the body of a
+    // heredoc a shell reads.
+    const script = egcShellScriptOf(raw);
+    if (script !== null) {
+      const whole = raw.trim();
+      if (whole) topLevel.push(whole);
+      if (depth >= MAX_SUBSTITUTION_DEPTH) return null;
+      const inner = extractSegments(script, depth + 1);
+      if (inner === null) return null;
+      topLevel.push(...inner);
+      continue;
+    }
     const { command: line, body } = splitHeredoc(raw);
     const trimmed = line.trim();
     if (trimmed) topLevel.push(trimmed);
