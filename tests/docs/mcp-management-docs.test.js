@@ -31,7 +31,7 @@ function read(relativePath) {
 console.log('\n=== Testing MCP management docs ===\n');
 
 test('token optimization guide separates Gemini MCP disables from EGC config filters', () => {
-  const source = read('docs/token-optimization.md');
+  const source = read('docs/guides/token-optimization.md');
 
   assert.ok(
     source.includes('Use `/mcp` to disable Gemini Code MCP servers'),
@@ -51,16 +51,33 @@ test('token optimization guide separates Gemini MCP disables from EGC config fil
   );
 });
 
+test('token optimization overview points at the guide and scopes EGC_DISABLED_MCPS to install time', () => {
+  const source = read('docs/token-optimization.md');
+
+  assert.ok(
+    source.includes('[guide](guides/token-optimization.md)'),
+    'Token overview should link to the guide instead of repeating it'
+  );
+  assert.ok(
+    source.includes('`EGC_DISABLED_MCPS` filters the EGC entries the installer and the Codex merge write; it never touches a server the tool loaded at runtime.'),
+    'Token overview should scope EGC_DISABLED_MCPS to install and sync time'
+  );
+  assert.ok(
+    !source.includes('disabledMcpServers'),
+    'Token overview should not tell users that a project setting disables runtime MCP servers'
+  );
+});
+
 test('README MCP guidance avoids settings.json disable instructions', () => {
   const source = read('README.md');
 
   assert.ok(
-    source.includes('Use `/mcp` for Gemini Code runtime disables; Gemini Code persists those choices in `~/.gemini.json`.'),
-    'README should route runtime MCP disables through /mcp and ~/.gemini.json'
+    source.includes('registers the two local MCP servers in each of them'),
+    'README should say EGC registers its two local MCP servers and no other'
   );
   assert.ok(
-    source.includes('`EGC_DISABLED_MCPS` is an EGC install/sync filter, not a live Gemini Code toggle.'),
-    'README should explain EGC_DISABLED_MCPS scope'
+    !source.includes('`EGC_DISABLED_MCPS` is a live'),
+    'README should not present EGC_DISABLED_MCPS as a live runtime toggle'
   );
   assert.ok(
     !source.includes('// In your project\'s .gemini/settings.json\n{\n  "disabledMcpServers"'),
