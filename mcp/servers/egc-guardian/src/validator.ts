@@ -905,6 +905,17 @@ function foldCase(p: string): string {
   return CASE_INSENSITIVE_FS ? p.toLowerCase() : p;
 }
 
+// `~`, `$HOME` and `${HOME}` at the start of a path name the home directory
+// once the shell is done with them; every path check reads them the same
+// way, so a file is recognized under each spelling of its location.
+const HOME_PARAMETER_RE = /^\$(?:HOME|\{HOME\})(?=[\\/]|$)/;
+
+function expandHome(p: string): string {
+  if (p.startsWith('~')) return path.join(os.homedir(), p.slice(1));
+  const parameter = HOME_PARAMETER_RE.exec(p);
+  return parameter ? path.join(os.homedir(), p.slice(parameter[0].length)) : p;
+}
+
 export function isProtectedPath(p: string, baseDir: string = process.cwd()): boolean {
   // Trim first: a trailing newline (routine for anything piped through
   // `echo`) or stray whitespace survives path.resolve() into the final
@@ -913,10 +924,7 @@ export function isProtectedPath(p: string, baseDir: string = process.cwd()): boo
   // allowed through (audit EGC-533).
   p = p.trim();
 
-  // Expand ~ at the start
-  const expanded = p.startsWith('~')
-    ? path.join(os.homedir(), p.slice(1))
-    : p;
+  const expanded = expandHome(p);
 
   // Resolve symlinks so a link inside an allowed directory cannot point past
   // this check into a denied path. Fall back to the lexical path (then the
@@ -1013,9 +1021,7 @@ export function isReadDeniedPath(p: string, baseDir: string = process.cwd()): bo
   if (!isProtectedPath(p, baseDir)) return false;
 
   const trimmed = p.trim();
-  const expanded = trimmed.startsWith('~')
-    ? path.join(os.homedir(), trimmed.slice(1))
-    : trimmed;
+  const expanded = expandHome(trimmed);
   const normalizedP = resolveRealOrLexical(path.resolve(baseDir, expanded));
 
   // An explicitly operational location is readable.
@@ -1826,6 +1832,16 @@ function validateCommandVerdict(command: string, cwd?: string): ValidationResult
   const destructiveDenial = destructiveVerdict(baseCommand, args);
   if (destructiveDenial) return destructiveDenial;
 
+  // 5b. A redirection target is a file the shell opens for the command,
+  // written (`>`, `>>`, `&>`) or read (`<`), and is judged against the
+  // protected paths here, before the per-command checks, which only see
+  // the argument the operator was glued to. The command line is read
+  // whole, the way the shell reads it, since a redirection may stand
+  // before the command, behind a wrapper or an environment assignment,
+  // or inside a process substitution.
+  const redirected = redirectionVerdict(command, cwd);
+  if (redirected) return redirected;
+
   // 6. Per-command checks (protected paths, destructive git/find forms,
   // dev-tool targets) and the allowlist verdict, always. They used to sit
   // behind the metacharacter step below, so any `2>/dev/null`, pipe or `$`
@@ -1902,6 +1918,274 @@ function pathCandidatesOf(args: string[]): string[] {
     if (!arg.startsWith('--') && arg.length > 2) return [unwrapFileUri(cased.slice(2))];
     return [];
   });
+}
+
+// A redirection names a file the shell opens on the command's behalf:
+// `> file` writes over it and `< file` reads it, whatever command stands in
+// front, and the shell reads the operator glued to its target (`>file`,
+// `word>file`) exactly as it reads it spaced (`> file`). The target is
+// therefore a filesystem operand like any other and is judged against the
+// same protected paths, before the per-command checks, which only see the
+// argument the operator was glued to.
+//
+// The command line is read here the way the shell reads it, on its own and
+// not through tokenizeWords: a backslash before a newline joins the two
+// lines; single quotes take everything literally; inside double quotes a
+// backslash escapes only a quote, a backslash, a dollar sign or a
+// backquote; outside quotes it escapes the next character; a parameter
+// expansion in braces (`${x:-y}`) is text up to its closing brace; an
+// unquoted `#` opening a word starts a comment. A command substitution,
+// `$(...)` or backquotes, inside double quotes too, is a command of its own
+// and its redirections are read on their own. A heredoc or a here-string
+// carries text, not a path; `<&` and a descriptor duplication (`2>&1`,
+// `>&-`) name no file; the body of a heredoc, up to its terminator line,
+// is data and is left out; a process substitution (`<(cmd)`) reads as an empty
+// target and the scan goes on inside the parentheses.
+const REDIRECTION_OPERATORS = ['<<<', '<<', '>>', '>|', '>&', '<>', '<&', '>', '<'];
+const WORD_BREAKS = new Set([' ', '\t', '\n', '\r', '|', '&', ';', '(', ')', '<', '>']);
+const DOUBLE_QUOTE_ESCAPES = new Set(['"', '\\', '$', '`']);
+
+interface ShellWord {
+  raw: string;
+  value: string;
+  end: number;
+}
+
+interface Redirection {
+  target: ShellWord;
+  writes: boolean;
+}
+
+// The quoted span opening at `start`: its value once the quotes are gone,
+// and the index past the closing quote (past the end when it never closes).
+function readQuoted(command: string, start: number): { value: string; end: number } {
+  const quote = command[start];
+  let value = '';
+  let i = start + 1;
+  while (i < command.length && command[i] !== quote) {
+    if (quote === '"' && command[i] === '\\' && DOUBLE_QUOTE_ESCAPES.has(command[i + 1] ?? '')) i += 1;
+    value += command[i];
+    i += 1;
+  }
+  return { value, end: Math.min(i + 1, command.length) };
+}
+
+// The line with its backslash-newline continuations removed, everywhere
+// but inside single quotes, where the shell keeps them.
+function joinContinuations(command: string): string {
+  let joined = '';
+  let i = 0;
+  while (i < command.length) {
+    const ch = command[i];
+    if (ch === "'") {
+      const end = readQuoted(command, i).end;
+      joined += command.slice(i, end);
+      i = end;
+    } else if (ch === '\\') {
+      if (command[i + 1] !== '\n') joined += command.slice(i, i + 2);
+      i += 2;
+    } else {
+      joined += ch;
+      i += 1;
+    }
+  }
+  return joined;
+}
+
+// Index past the span at `i` the shell reads as text rather than as
+// operators (a quoted span, an escaped character, a parameter expansion in
+// braces); `i` itself when no such span starts there.
+function skipText(command: string, i: number): number {
+  const ch = command[i];
+  if (ch === '"' || ch === "'") return readQuoted(command, i).end;
+  if (ch === '\\') return Math.min(i + 2, command.length);
+  if (ch === '$' && command[i + 1] === '{') {
+    const close = command.indexOf('}', i + 2);
+    return close === -1 ? command.length : close + 1;
+  }
+  return i;
+}
+
+// The word at `start`, leading blanks skipped, up to the next unquoted blank
+// or shell metacharacter: as typed, and as the shell would hand it over.
+function readWord(command: string, start: number): ShellWord {
+  let i = start;
+  while (i < command.length && (command[i] === ' ' || command[i] === '\t')) i += 1;
+  const from = i;
+  let value = '';
+  while (i < command.length && !WORD_BREAKS.has(command[i])) {
+    const ch = command[i];
+    if (ch === '"' || ch === "'") {
+      const quoted = readQuoted(command, i);
+      value += quoted.value;
+      i = quoted.end;
+    } else if (ch === '\\') {
+      value += command.slice(i + 1, i + 2);
+      i += 2;
+    } else if (ch === '$' && command[i + 1] === '{') {
+      const end = skipText(command, i);
+      value += command.slice(i, end);
+      i = end;
+    } else {
+      value += ch;
+      i += 1;
+    }
+  }
+  return { raw: command.slice(from, i), value, end: i };
+}
+
+// Position of the next `<` or `>` at or after `start` that the shell reads
+// as an operator, outside quotes and not escaped; -1 when there is none. A
+// comment (an unquoted `#` that opens a word) runs to the end of its line
+// and is skipped, since what follows the newline is read again.
+function nextOperator(command: string, start: number): number {
+  let i = start;
+  while (i < command.length) {
+    const skipped = skipText(command, i);
+    if (skipped !== i) {
+      i = skipped;
+      continue;
+    }
+    const ch = command[i];
+    if (ch === '#' && (i === 0 || WORD_BREAKS.has(command[i - 1]))) {
+      const newline = command.indexOf('\n', i);
+      if (newline === -1) return -1;
+      i = newline;
+      continue;
+    }
+    if (ch === '<' || ch === '>') return i;
+    i += 1;
+  }
+  return -1;
+}
+
+// The redirection whose operator starts at `at`, null when it names no
+// file; the delimiter of the heredoc it opens, if any; and the index the
+// scan resumes from.
+function redirectionAt(command: string, at: number): { redirection: Redirection | null; heredoc: string | null; next: number } {
+  const operator = REDIRECTION_OPERATORS.find(op => command.startsWith(op, at)) ?? command[at];
+  const target = readWord(command, at + operator.length);
+  if (operator === '<<') return { redirection: null, heredoc: target.value.replace(/^-/, ''), next: target.end };
+  const namesNoFile = operator === '<<<' || operator === '<&'
+    || (operator === '>&' && /^(?:\d+|-)$/.test(target.value))
+    || target.value.length === 0;
+  if (namesNoFile) return { redirection: null, heredoc: null, next: target.end };
+  return { redirection: { target, writes: operator !== '<' }, heredoc: null, next: target.end };
+}
+
+// Index of the newline ending the line that carries `delimiter` alone
+// (leading tabs allowed, as `<<-` strips them), searched from `start`; the
+// end of the command when that line never comes.
+function terminatorLineEnd(command: string, start: number, delimiter: string): number {
+  let lineStart = start;
+  while (lineStart < command.length) {
+    const newline = command.indexOf('\n', lineStart);
+    const lineEnd = newline === -1 ? command.length : newline;
+    if (command.slice(lineStart, lineEnd).replace(/^\t+/, '') === delimiter) return lineEnd;
+    lineStart = lineEnd + 1;
+  }
+  return command.length;
+}
+
+// Index of the end of the last terminator line of the heredocs opened on
+// the line that ends at `newline`: their bodies follow that line in order,
+// carry data, and are left out of the scan.
+function heredocBodiesEnd(command: string, newline: number, delimiters: string[]): number {
+  let end = newline;
+  for (const delimiter of delimiters) end = terminatorLineEnd(command, end + 1, delimiter);
+  return end;
+}
+
+// Index of the parenthesis closing the substitution whose body starts at
+// `start`, quoted spans and escapes skipped; the end of the line when it
+// never closes.
+function closingParenthesis(command: string, start: number): number {
+  let depth = 1;
+  let i = start;
+  while (i < command.length) {
+    const skipped = skipText(command, i);
+    if (skipped !== i) {
+      i = skipped;
+      continue;
+    }
+    if (command[i] === '(') depth += 1;
+    if (command[i] === ')') depth -= 1;
+    if (depth === 0) return i;
+    i += 1;
+  }
+  return command.length;
+}
+
+// The bodies of the command substitutions of the line, `$(...)` and
+// backquotes, inside double quotes too; a substitution nested in a body is
+// found when that body is read in turn.
+function substitutionBodies(command: string): string[] {
+  const bodies: string[] = [];
+  let i = 0;
+  while (i < command.length) {
+    const ch = command[i];
+    if (ch === "'" || ch === '\\') {
+      i = ch === "'" ? readQuoted(command, i).end : i + 2;
+    } else if (ch === '`') {
+      const close = command.indexOf('`', i + 1);
+      const end = close === -1 ? command.length : close;
+      bodies.push(command.slice(i + 1, end));
+      i = end + 1;
+    } else if (ch === '$' && command[i + 1] === '(') {
+      const end = closingParenthesis(command, i + 2);
+      bodies.push(command.slice(i + 2, end));
+      i = end + 1;
+    } else {
+      i += 1;
+    }
+  }
+  return bodies;
+}
+
+function redirectionsOf(line: string): Redirection[] {
+  const command = joinContinuations(line);
+  const found: Redirection[] = [];
+  const heredocs: string[] = [];
+  let from = 0;
+  let at = nextOperator(command, from);
+  while (at !== -1) {
+    const newline = command.indexOf('\n', from);
+    if (heredocs.length > 0 && newline !== -1 && newline < at) {
+      from = heredocBodiesEnd(command, newline, heredocs.splice(0));
+      at = nextOperator(command, from);
+      continue;
+    }
+    const { redirection, heredoc, next } = redirectionAt(command, at);
+    if (heredoc !== null) heredocs.push(heredoc);
+    if (redirection !== null) found.push(redirection);
+    from = next;
+    at = nextOperator(command, from);
+  }
+  for (const body of substitutionBodies(command)) found.push(...redirectionsOf(body));
+  return found;
+}
+
+// The spellings of a target that may name the file: what the shell hands
+// over and, on Windows, where a backslash separates path components rather
+// than escaping the next character, the word as typed.
+function targetSpellings(target: ShellWord): string[] {
+  return process.platform === 'win32' ? [target.value, target.raw] : [target.value];
+}
+
+function redirectionVerdict(command: string, cwd?: string): ValidationResult | null {
+  for (const { target, writes } of redirectionsOf(command)) {
+    const denies = writes ? isProtectedPath : isReadDeniedPath;
+    const denied = targetSpellings(target).find(spelling => denies(spelling, cwd));
+    if (denied === undefined) continue;
+    return {
+      allowed: false,
+      reason: writes
+        ? `redirecting output onto protected file '${denied}' is forbidden: the command would write over it, so send the output to another path`
+        : `redirecting input from protected file '${denied}' is forbidden: it would hand the command a credential, so read another file`,
+      trust_level: 'DANGEROUS',
+    };
+  }
+  return null;
 }
 
 // Catalogued commands (SAFE_READONLY/SAFE_DEV) get their own per-command
