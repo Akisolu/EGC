@@ -52,6 +52,42 @@ const PROPAGATION_FILES = [
 // (.git/worktrees/<name>) when run inside a linked worktree. Building the
 // path by hand from --git-dir would silently write bindings to a file git
 // never consults there, leaving worktree-based projects unprotected.
+// A .git entry of any kind, a symlink included even when it dangles: git
+// accepts .git as a link, and one that points nowhere is a checkout git
+// cannot open, not a directory outside any repository.
+function hasGitEntry(dir) {
+  try {
+    fs.lstatSync(path.join(dir, '.git'));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Whether projectDir sits inside a git working tree, judged from the
+// filesystem alone: a .git entry (a directory, or the file a linked worktree
+// and a submodule carry) in the directory or any parent. Consulted when git
+// itself cannot answer, so a tree git cannot open (a worktree whose gitdir
+// moved, a checkout git refuses to read) is still known to be a repository
+// and reported apart from a directory that is no repository at all.
+function isInsideGitWorkTree(projectDir) {
+  // The real path, so a symlinked project directory is walked where it
+  // actually lives; a path that does not exist keeps its resolved form.
+  let dir;
+  try {
+    dir = fs.realpathSync(projectDir);
+  } catch {
+    dir = path.resolve(projectDir);
+  }
+  let parent = path.dirname(dir);
+  while (parent !== dir) {
+    if (hasGitEntry(dir)) return true;
+    dir = parent;
+    parent = path.dirname(dir);
+  }
+  return hasGitEntry(dir);
+}
+
 function resolveAttributesFile(projectDir) {
   try {
     const raw = execFileSync(GIT_BIN, ['rev-parse', '--git-path', 'info/attributes'], {
@@ -178,7 +214,10 @@ function applyFilterConfig(projectDir, missingConfig, attributesFile, existing, 
 function configureMemoryFilters({ projectDir, scriptPath, dryRun = false }) {
   const attributesFile = resolveAttributesFile(projectDir);
   if (!attributesFile) {
-    return { configured: false, reason: 'not a git repository', actions: [] };
+    const reason = isInsideGitWorkTree(projectDir)
+      ? 'git could not open the repository this directory is in'
+      : 'not a git repository';
+    return { configured: false, reason, actions: [] };
   }
 
   // If the script this filter depends on isn't even on disk, configuring the
