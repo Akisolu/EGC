@@ -966,8 +966,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {
-            session_id: { type: "string", description: "Stable identifier for this session. Defaults to the id opened by get_state, falling back to a process-scoped id." },
-            project_path: { type: "string", description: "Absolute path to the project root. Defaults to current working directory." },
+            session_id: { type: "string", description: "Leave out: the bus always acts as this server's own session, and any other id is refused." },
+            project_path: { type: "string", description: "Absolute path to the project root. The first memory call or project-scoped bus call fixes this session's project (the working directory when omitted); a different project afterwards is refused." },
             territory: { type: "string", description: "Folder or theme this session is claiming informally, e.g. 'scripts/lib' or 'docs sweep'." }
           }
         }
@@ -978,7 +978,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {
-            session_id: { type: "string", description: "Session id acquiring the lock. Defaults to the current session." },
+            session_id: { type: "string", description: "Leave out: the lock is always taken by this server's own session, and any other id is refused." },
             path: { type: "string", description: "Repo-relative or absolute path (file or folder) to lock." },
             ttl_seconds: { type: "number", description: "Lock lifetime in seconds (1-3600, default 900)." }
           },
@@ -991,7 +991,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {
-            session_id: { type: "string", description: "Session id releasing the lock. Defaults to the current session." },
+            session_id: { type: "string", description: "Leave out: only this server's own session releases its locks, and any other id is refused." },
             path: { type: "string", description: "The locked path to release." }
           },
           required: ["path"]
@@ -999,11 +999,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "session_peers",
-        description: "List live sessions and active path locks on the session bus. Use before starting parallel work to see who is active and which territories are taken.",
+        description: "List the live sessions of this session's project and every active path lock on the session bus. Use before starting parallel work to see who is active and which territories are taken.",
         inputSchema: {
           type: "object",
           properties: {
-            project_path: { type: "string", description: "Filter sessions to one project. Omit for all projects." }
+            project_path: { type: "string", description: "Defaults to the project this session joined; a different project is refused. Locks are listed for every project, since a claim meets any live holder of the same path." }
           }
         }
       },
@@ -1013,9 +1013,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {
-            session_id: { type: "string", description: "Sender session id. Defaults to the current session." },
-            to_session: { type: "string", description: "Target session id from session_peers. Omit to broadcast to the whole project." },
-            project_path: { type: "string", description: "Project scope for broadcast delivery. Defaults to unscoped." },
+            session_id: { type: "string", description: "Leave out: events are always sent as this server's own session, and any other id is refused." },
+            to_session: { type: "string", description: "Target session id from session_peers; it must be live in this session's project. Omit to broadcast to the whole project." },
+            project_path: { type: "string", description: "Defaults to the project this session joined; a different project is refused." },
             kind: { type: "string", description: "Short event type, e.g. 'handoff', 'heads-up', 'done', 'request'." },
             payload: { type: "string", description: "Event body (max 16KB). Any string including JSON." }
           },
@@ -1028,8 +1028,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {
-            session_id: { type: "string", description: "Reader session id. Defaults to the current session." },
-            project_path: { type: "string", description: "Also include broadcasts scoped to this project." },
+            session_id: { type: "string", description: "Leave out: events are always read as this server's own session, and any other id is refused." },
+            project_path: { type: "string", description: "Defaults to the project this session joined; a different project is refused." },
             peek: { type: "boolean", description: "Read without advancing the cursor (events stay unconsumed)." }
           }
         }
@@ -1040,8 +1040,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {
-            session_id: { type: "string", description: "Reader session id. Defaults to the current session." },
-            project_path: { type: "string", description: "Also include broadcasts scoped to this project." },
+            session_id: { type: "string", description: "Leave out: events are always read as this server's own session, and any other id is refused." },
+            project_path: { type: "string", description: "Defaults to the project this session joined; a different project is refused." },
             timeout_ms: { type: "number", description: "Maximum time to wait in milliseconds (100-25000, default 10000)." }
           }
         }
@@ -1283,13 +1283,19 @@ async function handleLessonReinforce(db: Database, args: unknown) {
 
 // Implicit bus presence: every session that touches memory becomes visible
 // to its peers without anyone having to call session_announce explicitly.
+// Implicit presence follows memory calls, but only in the project the
+// session joined: reading or saving another project's memory still counts
+// as a heartbeat, refreshed where the session joined instead of moving it.
 async function announcePresenceBestEffort(db: Database, projPath: string): Promise<void> {
   try {
+    const joined = joinBusProject(projPath);
+    const project = 'refusal' in joined ? busProject : joined.project;
+    if (project === null) return;
     await writeArbitrator.enqueue(async () => {
       await busSweepDead(db);
-      await busAnnounce(db, { sessionId: resolveBusSessionId(), projectPath: projPath });
+      await busAnnounce(db, { sessionId: BUS_SESSION_ID, projectPath: project });
     });
-  } catch (_) { /* non-fatal: presence must never block memory reads */ } // NOSONAR
+  } catch (_) { /* non-fatal: presence must never block memory calls */ } // NOSONAR
 }
 
 // Sweep expired working memory entries throttled to once per hour, and run
@@ -1429,9 +1435,7 @@ async function handleUpdateState(db: Database, toolArgs: unknown) {
 
   // Implicit bus presence, mirroring get_state: saving memory also refreshes
   // this session's heartbeat so long-running sessions stay visible.
-  try {
-    await writeArbitrator.enqueue(async () => busAnnounce(db, { sessionId: resolveBusSessionId(), projectPath: projPath }));
-  } catch (_) { /* non-fatal: presence must never block memory writes */ } // NOSONAR
+  await announcePresenceBestEffort(db, projPath);
 
   // Close the open session if one exists.
   try {
@@ -1497,17 +1501,49 @@ async function handleUpdateState(db: Database, toolArgs: unknown) {
   return { content: [{ type: "text", text: `Project memory updated.\n${branchLine}${toolsLine}File: ${filePath}\nDecisions saved: ${args.decisions?.length || 0}\nNext session items: ${args.next?.length || 0}` }] };
 }
 
-// Stable per process. Reading the shared current_session_id here would let
-// another session's id leak in between claim and release (breaking the
-// claim/release symmetry) or make parallel sessions collide on one identity.
-function resolveBusSessionId(provided?: string): string {
-  return provided || `bus-${process.pid}`;
+// The bus acts for this server process only. The session id is fixed per
+// process (never the shared current_session_id, which would break the
+// claim/release symmetry and let parallel sessions collide on one identity),
+// and the project is fixed by the first call that resolves one: a memory
+// call or any bus call but claim_path and release_path, which carry no
+// project (binding there would pin the process directory). A caller cannot
+// name another session or another project: every read, send, announce and
+// release happens as this session, inside the project it joined.
+const BUS_SESSION_ID = `bus-${process.pid}`;
+let busProject: string | null = null;
+
+function foreignSessionRefusal(requested?: string): string | null {
+  if (requested === undefined || requested === BUS_SESSION_ID) return null;
+  return `Refused: this session is ${BUS_SESSION_ID} on the bus and cannot act as ${requested}. Leave session_id out.`;
+}
+
+function joinBusProject(requested?: string): { project: string } | { refusal: string } {
+  if (busProject === null) {
+    busProject = resolveProjectPath(requested);
+    return { project: busProject };
+  }
+  if (requested === undefined) return { project: busProject };
+  const resolved = resolveProjectPath(requested);
+  if (resolved === busProject) return { project: busProject };
+  return { refusal: `Refused: this session joined the bus for ${busProject} and cannot act in ${resolved}. Leave project_path out.` };
+}
+
+function busScope(args: { session_id?: string; project_path?: string }): { sessionId: string; projectPath: string } | { refusal: string } {
+  const foreign = foreignSessionRefusal(args.session_id);
+  if (foreign) return { refusal: foreign };
+  const joined = joinBusProject(args.project_path);
+  return 'refusal' in joined ? joined : { sessionId: BUS_SESSION_ID, projectPath: joined.project };
+}
+
+function refusedText(refusal: string) {
+  return { content: [{ type: "text", text: refusal }] };
 }
 
 async function handleSessionAnnounce(db: Database, toolArgs: unknown) {
   const args = SessionAnnounceSchema.parse(toolArgs || {});
-  const projPath = resolveProjectPath(args.project_path);
-  const sessionId = resolveBusSessionId(args.session_id);
+  const scope = busScope(args);
+  if ('refusal' in scope) return refusedText(scope.refusal);
+  const { sessionId, projectPath: projPath } = scope;
   // Presence is never refused, but a territory line that fails the scan is
   // stored as the block marker instead of reaching every peer's context.
   const territoryCheck = args.territory === undefined ? null : sanitize(args.territory);
@@ -1541,7 +1577,9 @@ function describePeer(p: Record<string, unknown>): string {
 
 async function handleClaimPath(db: Database, toolArgs: unknown) {
   const args = ClaimPathSchema.parse(toolArgs || {});
-  const sessionId = resolveBusSessionId(args.session_id);
+  const foreign = foreignSessionRefusal(args.session_id);
+  if (foreign) return refusedText(foreign);
+  const sessionId = BUS_SESSION_ID;
   const result = await writeArbitrator.enqueue(async () => {
     await busSweepDead(db);
     return busClaimPath(db, { sessionId, path: args.path, ttlSeconds: args.ttl_seconds });
@@ -1555,16 +1593,21 @@ async function handleClaimPath(db: Database, toolArgs: unknown) {
 
 async function handleReleasePath(db: Database, toolArgs: unknown) {
   const args = ReleasePathSchema.parse(toolArgs || {});
-  const sessionId = resolveBusSessionId(args.session_id);
+  const foreign = foreignSessionRefusal(args.session_id);
+  if (foreign) return refusedText(foreign);
+  const sessionId = BUS_SESSION_ID;
   const released = await writeArbitrator.enqueue(async () => busReleasePath(db, { sessionId, path: args.path }));
   return { content: [{ type: "text", text: released ? `Lock released: ${args.path}` : `No lock held by ${sessionId} on ${args.path}; nothing released.` }] };
 }
 
 async function handleSessionPeers(db: Database, toolArgs: unknown) {
   const args = SessionPeersSchema.parse(toolArgs || {});
+  const joined = joinBusProject(args.project_path);
+  if ('refusal' in joined) return refusedText(joined.refusal);
   await writeArbitrator.enqueue(async () => busSweepDead(db));
-  const projPath = args.project_path ? resolveProjectPath(args.project_path) : undefined;
-  const peers = await busListPeers(db, projPath);
+  const peers = await busListPeers(db, joined.project);
+  // Locks stay listed for every project: a claim is refused by any live
+  // holder of the same path, and this list is where a session sees who.
   const locks = await busListLocks(db);
   const peerLines = peers.map(describePeer);
   const lockLines = locks.map(l => `- ${rowText(l.path)} held by ${rowText(l.session_id)} (ttl ${rowText(l.ttl_seconds)}s)`);
@@ -1573,8 +1616,9 @@ async function handleSessionPeers(db: Database, toolArgs: unknown) {
 
 async function handleSessionSend(db: Database, toolArgs: unknown) {
   const args = SessionSendSchema.parse(toolArgs || {});
-  const fromSession = resolveBusSessionId(args.session_id);
-  const projPath = args.project_path ? resolveProjectPath(args.project_path) : undefined;
+  const scope = busScope(args);
+  if ('refusal' in scope) return refusedText(scope.refusal);
+  const { sessionId: fromSession, projectPath: projPath } = scope;
   // A bus payload lands verbatim in another session's context: the same
   // scan that guards project state runs here before anything is stored.
   // The sender's heartbeat is refreshed whether or not the send goes out.
@@ -1606,8 +1650,9 @@ async function handleSessionSend(db: Database, toolArgs: unknown) {
 
 async function handleSessionEvents(db: Database, toolArgs: unknown) {
   const args = SessionEventsSchema.parse(toolArgs || {});
-  const sessionId = resolveBusSessionId(args.session_id);
-  const projPath = args.project_path ? resolveProjectPath(args.project_path) : undefined;
+  const scope = busScope(args);
+  if ('refusal' in scope) return refusedText(scope.refusal);
+  const { sessionId, projectPath: projPath } = scope;
   const events = await writeArbitrator.enqueue(async () => {
     await busSweepDead(db);
     await busAnnounce(db, { sessionId, projectPath: projPath });
@@ -1647,8 +1692,9 @@ function getMeshTransport(): MeshTransport {
 
 async function handleSessionWait(db: Database, toolArgs: unknown) {
   const args = SessionWaitSchema.parse(toolArgs || {});
-  const sessionId = resolveBusSessionId(args.session_id);
-  const projPath = args.project_path ? resolveProjectPath(args.project_path) : undefined;
+  const scope = busScope(args);
+  if ('refusal' in scope) return refusedText(scope.refusal);
+  const { sessionId, projectPath: projPath } = scope;
 
   // Presence refresh (a write) happens exactly once, on the first read. The
   // re-reads inside the wait loop must stay write-free while empty: this
