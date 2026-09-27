@@ -2,7 +2,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { isIgnoredSourceDirectory, isIgnoredSourceFile } = require('../install-source-filters');
+const { isGeneratedRuntimeSourcePath, isIgnoredSourceDirectory, isIgnoredSourceFile } = require('../install-source-filters');
 
 const PLATFORM_SOURCE_PATH_OWNERS = Object.freeze({
   '.gemini-plugin': 'egc',
@@ -407,42 +407,58 @@ function createDefaultScaffoldOperations(input, adapter) {
   });
 }
 
-// What today's scaffold operations would actually write, at the
-// granularity the install-state records: single files in `files`,
-// whole source directories (still copied recursively, one child file
-// at a time) in `dirs`. Mirrors the file/directory split
-// materializeScaffoldOperation (install-executor.js) applies when it
-// turns these same scaffold operations into the copy-file entries
-// the state records, so a directory scaffold entry here shields every
-// file under it even though no single copy-file operation names the
-// directory itself.
-function collectCurrentlyCoveredDestinations(operations, repoRoot) {
-  const files = new Set();
-  const dirs = new Set();
-  for (const operation of Array.isArray(operations) ? operations : []) {
-    const destination = typeof operation.destinationPath === 'string' ? operation.destinationPath : null;
-    if (!destination) continue;
-    const resolvedDestination = path.resolve(destination);
-    const source = typeof operation.sourceRelativePath === 'string' ? operation.sourceRelativePath : null;
-    if (!source) {
-      // Nothing repo-relative to check the shape of (a merge or hook
-      // operation may carry its payload some other way): treat the
-      // destination as covered rather than guess, so it is never offered
-      // up for retirement by mistake.
-      files.add(resolvedDestination);
-      continue;
+// The destinations one scaffold operation writes, added to `covered`. A
+// directory copy covers the files it copies today, listed as
+// materializeScaffoldOperation lists them (names unchanged, ignored names
+// and generated install-states left out), not every path under its
+// destination; a directory that cannot be listed shields its whole subtree.
+function addDirectoryCoverage(source, sourceDir, resolvedDestination, covered) {
+  try {
+    for (const relativeFile of listRelativeFiles(sourceDir)) {
+      if (isGeneratedRuntimeSourcePath(`${source}/${relativeFile}`)) continue;
+      covered.files.add(path.join(resolvedDestination, ...relativeFile.split('/')));
     }
-    let stat;
-    try {
-      stat = fs.statSync(path.join(repoRoot, ...normalizeRelativePath(source).split('/')));
-    } catch {
-      // Source unreadable from here: same reasoning, stay conservative.
-      files.add(resolvedDestination);
-      continue;
-    }
-    (stat.isDirectory() ? dirs : files).add(resolvedDestination);
+  } catch {
+    covered.dirs.add(resolvedDestination);
   }
-  return { files, dirs };
+}
+
+function addOperationCoverage(operation, repoRoot, covered) {
+  const destination = typeof operation.destinationPath === 'string' ? operation.destinationPath : null;
+  if (!destination) return;
+  const resolvedDestination = path.resolve(destination);
+  const source = typeof operation.sourceRelativePath === 'string' ? normalizeRelativePath(operation.sourceRelativePath) : null;
+  // Nothing repo-relative to check the shape of (a merge or hook operation
+  // may carry its payload some other way), or a source unreadable from
+  // here: treat the destination as covered rather than guess, so it is
+  // never offered up for retirement by mistake.
+  if (!source) {
+    covered.files.add(resolvedDestination);
+    return;
+  }
+  const sourcePath = path.join(repoRoot, ...source.split('/'));
+  let stat;
+  try {
+    stat = fs.statSync(sourcePath);
+  } catch {
+    covered.files.add(resolvedDestination);
+    return;
+  }
+  if (stat.isDirectory()) addDirectoryCoverage(source, sourcePath, resolvedDestination, covered);
+  else covered.files.add(resolvedDestination);
+}
+
+// What today's scaffold operations would actually write, at the
+// granularity the install-state records: one destination per file, so a
+// file that left a planned directory, or another module's file under a
+// directory copied onto the target root itself (codex's `.agents`, egc's
+// `.gemini-plugin`, cursor's `.cursor/scripts`), is no longer shielded.
+function collectCurrentlyCoveredDestinations(operations, repoRoot) {
+  const covered = { files: new Set(), dirs: new Set() };
+  for (const operation of Array.isArray(operations) ? operations : []) {
+    addOperationCoverage(operation, repoRoot, covered);
+  }
+  return covered;
 }
 
 function isDestinationCovered(resolved, { files, dirs }) {
