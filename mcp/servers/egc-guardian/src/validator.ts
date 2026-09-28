@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import { readParallelOption } from './parallel-options.js';
 import { LOCAL_WRAPPER_SPECS } from './local-wrappers.js';
 import { RUNNER_SPECS, type RunnerSpec } from './runner-wrappers.js';
+import { programCommandOf, gitWordsNamingFiles, type ProgramRead } from './pattern-operands.js';
+import { programRefs } from './program-refs.js';
 
 export { RUNNER_SPECS } from './runner-wrappers.js';
 
@@ -2139,8 +2141,10 @@ function checkGitPathArguments(args: string[], subcommandIdx: number, cwd?: stri
   const globals = (subcommandIdx < 0 ? args : args.slice(0, subcommandIdx)).filter(arg => !isGluedGitSetting(arg));
   const rest = subcommandIdx < 0 ? [] : args.slice(subcommandIdx + 1);
   const pathOnly = GIT_PATH_ONLY_SUBCOMMANDS.has(subcommand);
-  const reached = pathOnly ? [...globals, ...gitReadOptionFiles(subcommand, rest)] : [...globals, ...rest];
-  const objects = pathOnly ? [] : gitObjectFiles(globals, rest, cwd);
+  // A message, a search or a grep pattern is text, not a file it names.
+  const named = pathOnly ? [] : gitWordsNamingFiles(subcommand, rest);
+  const reached = pathOnly ? [...globals, ...gitReadOptionFiles(subcommand, rest)] : [...globals, ...named];
+  const objects = pathOnly ? [] : gitObjectFiles(globals, named, cwd);
   const read = [...pathCandidatesOf(reached), ...objects].find(p => isReadDeniedOperand(p, cwd));
   if (read !== undefined) return readDenial(`git ${subcommand} would read the protected file '${read}' and is forbidden.`, 'DANGEROUS');
   const written = gitOutputFiles(subcommand, rest).find(p => isProtectedOperand(p, cwd));
@@ -2280,6 +2284,16 @@ function isLiveShellChar(ch: string, quote: string | null): boolean {
   return quote === '"' ? ch === '$' || ch === '`' : SHELL_SYNTAX_RE.test(ch);
 }
 
+// A command another tool runs (a git option, a sed e, an ag --pager, an rg
+// --pre) is inline code when it has shell syntax, names a shell, or names an
+// interpreter alone, which then reads its program from what it is handed.
+function isInlineProgram(value: string): boolean {
+  const words = value.trim().split(/\s+/);
+  const program = commandName(words[0] ?? '');
+  if (hasShellSyntax(value) || GIT_VALUE_SHELLS.has(program)) return true;
+  return words.length === 1 && Object.hasOwn(INLINE_EVAL_COMMANDS, bareInterpreterName(program));
+}
+
 function gitInlineCommandDenial(subcommand: string, option: string): ValidationResult {
   return {
     allowed: false,
@@ -2295,8 +2309,7 @@ function gitInlineCommandDenial(subcommand: string, option: string): ValidationR
 // removed (shellWord); the quotes left in it are the ones the shell git
 // hands it to reads.
 function gitCommandValueDenial(subcommand: string, option: string, value: string, cwd?: string): ValidationResult | null {
-  const program = commandName(value.trim().split(/\s+/)[0] ?? '');
-  if (hasShellSyntax(value) || GIT_VALUE_SHELLS.has(program)) return gitInlineCommandDenial(subcommand, option);
+  if (isInlineProgram(value)) return gitInlineCommandDenial(subcommand, option);
   const verdict = validateCommandVerdict(value, cwd);
   return verdict.allowed || verdict.advisory ? null : verdict;
 }
@@ -3631,13 +3644,53 @@ function withoutInputRedirections(args: string[], raw: string[]): string[] {
 // script, naming a protected file with them is flagged, not grave.
 const COMMITTED_READ_BUILTINS = new Set(['[', '[[', 'test', '.', 'source']);
 
+// A command a sed e, an ag --pager or an rg --pre runs: inline code (see
+// isInlineProgram) is refused as sh -c is; a plain one is judged as the
+// command it is.
+function embeddedCommandDenial(baseCommand: string, inner: string): ValidationResult | null {
+  if (isInlineProgram(inner)) {
+    return { allowed: false, reason: `'${baseCommand}' hands '${inner}' to a shell or an interpreter, which is inline code; write it to a script and name the script`, trust_level: 'DANGEROUS' };
+  }
+  const verdict = validateCommand(inner);
+  if (verdict.allowed !== false || verdict.advisory) return null;
+  return { allowed: false, reason: `'${baseCommand}' runs '${inner}': ${verdict.reason}`, trust_level: 'DANGEROUS' };
+}
+
+// What a sed, awk, jq, yq, rg or ag command names beyond its words: the files
+// its program text names, judged with those words; the commands its program
+// or its options run, judged as commands; what the program builds from the
+// data it reads, which is refused.
+function programTextVerdict(baseCommand: string, read: ProgramRead): { files: string[]; denial: ValidationResult | null } {
+  const files: string[] = [];
+  const commands = [...read.commands];
+  for (const text of read.programs) {
+    const refs = programRefs(read.language, text);
+    if (refs.opaque) {
+      return { files, denial: { allowed: false, reason: `'${baseCommand}' ${refs.opaque}, which cannot be judged before it runs; write that part in the shell instead, where it is judged`, trust_level: 'DANGEROUS' } };
+    }
+    commands.push(...refs.commands);
+    files.push(...refs.files);
+  }
+  for (const inner of commands) {
+    const denial = embeddedCommandDenial(baseCommand, inner);
+    if (denial) return { files, denial };
+  }
+  return { files, denial: null };
+}
+
 function validateAgainstAllowlist(baseCommand: string, args: string[], cwd?: string, rawArgs: string[] = args): ValidationResult {
   if (SAFE_READONLY.includes(baseCommand) || SAFE_DEV.includes(baseCommand)) {
     return validateCommandArgs(baseCommand, args, cwd);
   }
   // A committed script reads files through `<` as the reads they are.
   const candidates = committedScript ? withoutInputRedirections(args, rawArgs) : args;
-  const protectedTarget = pathCandidatesOf(candidates).find(arg => isProtectedPath(arg, cwd));
+  // The program, pattern or filter of sed, awk, jq and the like is text; the
+  // files and the commands its own text names are judged.
+  const read = programCommandOf(baseCommand, candidates);
+  const program = read ? programTextVerdict(baseCommand, read) : { files: [], denial: null };
+  if (program.denial) return program.denial;
+  const named = read ? [...read.files, ...program.files] : candidates;
+  const protectedTarget = pathCandidatesOf(named).find(arg => isProtectedPath(arg, cwd));
   if (protectedTarget) {
     const denial: ValidationResult = {
       allowed: false,
