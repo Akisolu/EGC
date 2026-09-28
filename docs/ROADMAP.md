@@ -58,6 +58,7 @@ This document is the release-by-release record of EGC (Extended Global Context):
 - The hooks schema reads the four shapes the validator reads, the cost trackers share one cost source, and the lifecycle commands share their skeleton (#1584).
 - Host plugins (Amp, Cline, OpenCode) are installed only where their host loads them, and the unloadable copies earlier installs left under scripts/hooks are retired (#1555).
 - The Bash hook follows sudo -R and sudo -i to where sudo runs a script, and fails closed on a script it cannot read (#1556).
+- The Gemini and Ollama providers retry a rate limit, a server error or a timeout up to three times with backoff, honouring Retry-After, and fail at once on anything a later attempt cannot fix (#1585).
 - The Bash hook reads the command line as the shell does to find the script it runs, and holds scripts committed in git and unchanged to the grave denials only (#1557).
 - The Bash hook and the Guardian read a shell comment as bash does: a `#` that opens a word is inert, one inside quotes or `${...}` or glued to a word is not (#1558).
 - A command whose name comes from a variable the command fixes is judged by the name it resolves to; opaque sources fail closed, the environment stays advisory (#1559).
