@@ -1326,8 +1326,8 @@ export const PROTECTED_FILE_PATTERNS: RegExp[] = [
   new RegExp(String.raw`${DEVICE_DIR}(?:${NUMBERED_DEVICES.join('|')})\d`),
   new RegExp(`${DEVICE_DIR}(?:k?mem|port)$`),
   new RegExp(String.raw`${DEVICE_DIR}(?:disk[\\/][^\\/]+|mapper|block)[\\/].`),
-  /^[\\/]proc[\\/]kcore$/,
-  /^[\\/]proc[\\/](?:\d+|self|thread-self)[\\/](?:task[\\/]\d+[\\/])?mem$/,
+  /^(?:[a-z]:)?[\\/]proc[\\/]kcore$/,
+  /^(?:[a-z]:)?[\\/]proc[\\/](?:\d+|self|thread-self)[\\/](?:task[\\/]\d+[\\/])?mem$/,
   /^\\\\[.?]\\(?:physicaldrive\d|[a-z]:|globalroot\\|harddisk|cdrom\d|tape\d)/,
 ];
 
@@ -1390,11 +1390,17 @@ export function buildDeniedPaths(): string[] {
     // The browser profiles Windows keeps under LocalAppData.
     const browsers = ['Google/Chrome/User Data', 'Microsoft/Edge/User Data', 'BraveSoftware/Brave-Browser/User Data']
       .map(profile => path.join(localAppData, ...profile.split('/')));
+    // The shell Git for Windows ships reads /etc from its install, where its
+    // system gitconfig and profile live: the machine-wide one and the
+    // per-user one.
+    const programFiles = process.env.ProgramFiles || String.raw`C:\Program Files`;
     paths.push(
       path.join(userProfile, '.ssh'),
       path.join(userProfile, '.aws'),
       appData,
       ...browsers,
+      path.join(programFiles, 'Git', 'etc'),
+      path.join(localAppData, 'Programs', 'Git', 'etc'),
     );
   }
 
@@ -1522,12 +1528,7 @@ export function isProtectedPath(p: string, baseDir: string = process.cwd()): boo
   // that way -- on Linux those are genuinely different files.
   const candidate = foldCase(normalizedP);
 
-  for (const denied of DENIED_PATHS) {
-    const resolvedDenied = foldCase(resolveRealOrLexical(denied));
-    if (candidate === resolvedDenied || candidate.startsWith(resolvedDenied + path.sep)) {
-      return true;
-    }
-  }
+  if (isUnderDeniedDirectory(normalizedP)) return true;
 
   for (const pattern of PROTECTED_FILE_PATTERNS) {
     if (pattern.test(candidate)) {
@@ -1587,10 +1588,20 @@ const READ_SAFE_FILE_PATTERNS: RegExp[] = [
   /(^|[\\/])\.gitconfig$/,
 ];
 
+// A path with its Windows drive letter taken off.
+function withoutDrive(p: string): string {
+  return p.replace(/^[a-z]:/i, '');
+}
+
+// A POSIX system path (`/etc`) has no drive: a shell on Windows reads it
+// from its own root, and Node resolves it below whichever drive is current,
+// so there it is matched below any drive.
 function isUnder(candidate: string, parent: string): boolean {
+  const driveless = process.platform === 'win32' && parent.startsWith('/');
   const resolvedParent = foldCase(resolveRealOrLexical(parent));
   const folded = foldCase(candidate);
-  return folded === resolvedParent || folded.startsWith(resolvedParent + path.sep);
+  const [inside, above] = driveless ? [withoutDrive(folded), withoutDrive(resolvedParent)] : [folded, resolvedParent];
+  return inside === above || inside.startsWith(above + path.sep);
 }
 
 // Whether the protection comes from the path living inside a denied

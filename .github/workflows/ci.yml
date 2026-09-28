@@ -30,7 +30,8 @@ jobs:
   test:
     name: Test (${{ matrix.os }}, Node ${{ matrix.node }}, ${{ matrix.pm }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    # The Guardian suites take the slowest Windows lanes to about 15 minutes.
+    timeout-minutes: 25
 
     strategy:
       fail-fast: false
@@ -158,6 +159,17 @@ jobs:
             bun) bun install ;;
             *) echo "Unsupported package manager: ${{ matrix.pm }}" && exit 1 ;;
           esac
+
+      # The Guardian suites skip when the compiled validator is absent
+      # (build/ is gitignored). Building it on every OS runs them where
+      # paths and shells differ, not on the Linux coverage job alone; the
+      # memory server keeps to that job for its native sqlite3 build.
+      - name: Build the Guardian
+        shell: bash
+        run: |
+          npm --prefix mcp/servers/egc-guardian ci
+          npm --prefix mcp/servers/egc-guardian run build
+          test -f mcp/servers/egc-guardian/build/validator.js
 
       # Run tests
       - name: Run tests
