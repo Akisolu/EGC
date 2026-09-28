@@ -50,6 +50,7 @@ This document is the release-by-release record of EGC (Extended Global Context):
 - Every form of the installed protocol passes cwd to validate_write, and the protocol version moves to 9 (#1580).
 - The Economy tab shows a provider name as text: a provider the panel does not know is labeled with its escaped id (#1546).
 - A wrapper's long options are read in any abbreviation the wrapper accepts: a unique prefix counts as the option it names, an exact name keeps its own meaning, and `env --split` is refused like `--split-string` (#1548).
+- The dashboard's data routes ask for the dashboard token, which every page it serves carries (#1581).
 - GNU parallel's options are read the way parallel reads them: its own Getopt::Long table, letter case, abbreviations and optional values included (#1549).
 - The Bash hook finds the command behind a wrapper by the validator's own rules, through a shared copy that a test keeps in step with the validator (#1550).
 - The Guardian reads through the local wrappers that run a command (setsid, taskset, chrt, unshare, nsenter, runuser, prlimit, chroot, numactl, pkexec, busybox, bwrap) by their own option tables, and denies the ones that hand a string or the words after a user to a shell (#1551).
