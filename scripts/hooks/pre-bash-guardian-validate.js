@@ -757,6 +757,174 @@ function segmentWithVariants(segment, context, unknownFails, depth) {
   return { segments: [...new Set(found)] };
 }
 
+// Code a shell reads only after this line's own shell has expanded it: the
+// body of a heredoc with an unquoted delimiter that a shell reads, and the
+// code of -c or eval in a word that expands. The value a variable takes
+// there is read as code a second time, which one reading of the line misses.
+function expandedCodes(text) {
+  const codes = [];
+  for (const stage of splitShellSegments(joinContinuations(text), { stripComments: true }).flatMap(pipelineStages)) {
+    const { command: line, body } = splitHeredoc(stage);
+    if (body !== null && readsItsInputAsCode(line) && !literalHeredoc(line, body)) codes.push(body);
+    const inline = expandedInlineCode(line);
+    if (inline !== null) codes.push(inline);
+  }
+  return codes;
+}
+
+// The code of -c or eval as the line's own shell hands it over, when a word
+// of it expands: the -c operand as written, its $1 and on left alone, since
+// the shell running the code expands those without reading them as code.
+function expandedInlineCode(line) {
+  const carrier = inlineCodeWords(line);
+  if (carrier === null) return null;
+  if (carrier.evaluated) return carrier.words.some(word => word.expands) ? carrier.words.map(word => word.value).join(' ') : null;
+  return carrier.words[0].expands ? carrier.words[0].value : null;
+}
+
+const MAX_SECOND_READINGS = 64;
+const NAME_START = /[A-Za-z_]/;
+const NAME_PART = /\w/;
+
+// Whether the character at `at` is escaped by the backslashes before it.
+function escapedAt(text, at) {
+  let count = 0;
+  while (at - count > 0 && text[at - count - 1] === '\\') count += 1;
+  return count % 2 === 1;
+}
+
+// The variable a `$` at `at` reads, as { name, operator, end }: $NAME or
+// ${NAME...}, the operator being whatever follows the name inside the
+// braces; null for anything else ($1, $?, $(...), an escaped $).
+function referenceAt(text, at) {
+  if (escapedAt(text, at)) return null;
+  const braced = text[at + 1] === '{';
+  let end = at + (braced ? 2 : 1);
+  if (!NAME_START.test(text[end] ?? '')) return null;
+  const start = end;
+  while (end < text.length && NAME_PART.test(text[end])) end += 1;
+  const name = text.slice(start, end);
+  if (!braced) return { name, operator: '', end };
+  const close = text.indexOf('}', end);
+  if (close === -1) return null;
+  return { name, operator: text.slice(end, close), end: close + 1 };
+}
+
+// Every variable reference the code holds, in order, as referenceAt tells.
+function variableReferences(code) {
+  const references = [];
+  for (let at = code.indexOf('$'); at !== -1; at = code.indexOf('$', at + 1)) {
+    const reference = referenceAt(code, at);
+    if (reference) references.push({ ...reference, start: at });
+  }
+  return references;
+}
+
+// The ${NAME...} operators this hook follows: those that fall back to their
+// word (-, =, ?) and the one that swaps it in (+), each with or without :.
+const FALLBACK_OPERATOR_RE = /^:?([-=?+])/;
+const referenceKey = ({ name, operator }) => `${name}${operator}`;
+
+// The values one reference takes the second time the code is read: those
+// the line gives the variable (every name counts as given once the line
+// sources a script or builds a name at run time), or the environment's own
+// value for a name the line leaves to it; null when there is nothing to
+// read again; the reason it cannot be read otherwise.
+function referenceValues(reference, bindings, unknownFails) {
+  const { name, operator } = reference;
+  if (!bindings.names.has(name) && !bindings.sources && !bindings.dynamic) {
+    const env = process.env[name];
+    return typeof env === 'string' && !operator ? { values: [env] } : null;
+  }
+  const own = valuesOf(bindings, name, process.env);
+  if (own === null) {
+    return { blocked: `the code a shell reads a second time takes $${name}, which this line sets from a source this hook cannot read; write the value out or quote the heredoc delimiter` };
+  }
+  return operatorValues(reference, own, unknownFails);
+}
+
+// The values a reference takes once its operator applies to the variable's.
+function operatorValues({ name, operator }, own, unknownFails) {
+  if (!operator) return { values: own };
+  const fallback = FALLBACK_OPERATOR_RE.exec(operator);
+  const word = fallback ? operator.slice(fallback[0].length) : '';
+  if (fallback && !/[$`]/.test(word)) {
+    if (fallback[1] === '+') return { values: [word, ''] };
+    return { values: fallback[1] === '?' ? own : [...new Set([...own, word])] };
+  }
+  // A committed script is held to the grave denials only: the variable's
+  // own values stand in for what the expansion makes of them.
+  if (!unknownFails) return { values: own };
+  return { blocked: `the code a shell reads a second time takes \${${name}${operator}}, an expansion this hook does not follow; write the value out or quote the heredoc delimiter` };
+}
+
+// The values each reference of the code takes, keyed by the reference.
+function secondReadValues(references, bindings, unknownFails) {
+  const values = new Map();
+  for (const reference of references) {
+    const key = referenceKey(reference);
+    if (values.has(key)) continue;
+    const found = referenceValues(reference, bindings, unknownFails);
+    if (found === null) continue;
+    if (found.blocked) return found;
+    values.set(key, found.values);
+  }
+  return { values };
+}
+
+// The code with each reference in `choice` replaced by its value.
+function substituted(code, references, choice) {
+  let text = '';
+  let from = 0;
+  for (const reference of references) {
+    const key = referenceKey(reference);
+    if (!choice.has(key)) continue;
+    text += code.slice(from, reference.start) + choice.get(key);
+    from = reference.end;
+  }
+  return text + code.slice(from);
+}
+
+// The code as the shell reads it the second time, once per combination of
+// the values its references take.
+function codeVariants(code, bindings, unknownFails) {
+  const references = variableReferences(code);
+  const found = secondReadValues(references, bindings, unknownFails);
+  if (found.blocked) return found;
+  let choices = [new Map()];
+  for (const [key, values] of found.values) {
+    choices = choices.flatMap(choice => values.map(value => new Map([...choice, [key, value]])));
+    if (choices.length > MAX_SECOND_READINGS) {
+      return { blocked: 'the code a shell reads a second time takes more combinations of values than this hook follows; write the values out' };
+    }
+  }
+  const texts = choices.map(choice => substituted(code, references, choice));
+  return { texts: [...new Set(texts)].filter(text => text !== code) };
+}
+
+// The segments of the code a text hands a shell to read a second time, each
+// reading resolved like any segment. A value this hook cannot read fails
+// closed when `unknownFails`, and is left as it is otherwise (a committed
+// script, held only to the grave denials).
+function secondReadings(text, bindings, unknownFails) {
+  const found = [];
+  for (const code of expandedCodes(text)) {
+    const variants = codeVariants(code, bindings, unknownFails);
+    if (variants.blocked) {
+      if (unknownFails) return { blocked: variants.blocked };
+      continue;
+    }
+    for (const variant of variants.texts) {
+      const nested = extractSegments(variant, 1);
+      if (nested === null) return { blocked: NESTED_TOO_DEEP };
+      const resolved = resolveCommandWords(nested, bindings, unknownFails);
+      if (resolved.blocked) return resolved;
+      found.push(...resolved.segments);
+    }
+  }
+  return { segments: found };
+}
+
 // A script operand that is exactly one resolvable variable, spread to the
 // literal filenames that variable takes; otherwise the operand unchanged.
 // Unquoted, a value is split on blanks as the shell splits it, and its first
@@ -1052,16 +1220,18 @@ function nestedSegmentsOf(file, depth, seen) {
   if (seen.has(real)) return { segments: null };
   seen.add(real);
   if (depth >= MAX_SCRIPT_DEPTH) return { blocked: `scripts nest deeper than ${MAX_SCRIPT_DEPTH} levels` };
+  let text;
   let nested;
   try {
-    nested = extractSegments(fs.readFileSync(file, 'utf8'));
+    text = fs.readFileSync(file, 'utf8');
+    nested = extractSegments(text);
   } catch {
     return { blocked: `script ${file} cannot be read` };
   }
   if (nested === null) {
     return { blocked: 'a script it runs nests command/process substitutions deeper than this validator can safely unwrap and analyze' };
   }
-  return { segments: nested };
+  return { segments: nested, text };
 }
 
 // Segments of every script the command runs, following scripts that run
@@ -1226,7 +1396,9 @@ function fileSegmentsOf(file, operands, depth, seen, context) {
   const bindings = mergeBindings(context.bindings, ownBindings);
   const words = resolveCommandWords(nested.segments, bindings, !committedFile);
   if (words.blocked) return { segments: [], own: [], committed: [], blocked: `script ${file}: ${words.blocked}` };
-  const own = words.segments;
+  const reread = secondReadings(nested.text, bindings, !committedFile);
+  if (reread.blocked) return { segments: [], own: [], committed: [], blocked: `script ${file}: ${reread.blocked}` };
+  const own = [...words.segments, ...reread.segments];
   const mark = committedFile ? { bound: boundAssignments(nested.segments, context.callerSet) } : false;
   // A script the wrapper moved into a directory runs its own children there.
   const ownWrites = writesOf(own, operands.base, false);
@@ -1510,26 +1682,37 @@ function withNested(own, script, depth) {
 // eval itself is only flagged, and what it runs still meets the grave
 // denials. null when the stage runs no such code.
 function inlineShellCodeOf(line) {
+  const carrier = inlineCodeWords(line);
+  if (carrier === null) return null;
+  return carrier.evaluated ? carrier.words.map(word => word.value).join(' ') : withPositionals(carrier.words[0].value, carrier.words.slice(1));
+}
+
+// The words that carry that code: every word after eval, or the operand of
+// a shell's -c followed by its $0, $1 and on; null when there is none.
+function inlineCodeWords(line) {
   const words = shellWords(line);
   const index = skipEnvAndWrappers(words);
   const name = commandName(words[index]?.value);
-  if (name === 'eval') return words.length > index + 1 ? words.slice(index + 1).map(word => word.value).join(' ') : null;
+  if (name === 'eval') return words.length > index + 1 ? { words: words.slice(index + 1), evaluated: true } : null;
   if (!SHELL_INTERPRETERS.has(name) || name === 'source' || name === '.') return null;
-  return shellCommandString(words.slice(index + 1));
+  const rest = words.slice(index + 1);
+  const at = shellCommandIndex(rest);
+  return at < 0 ? null : { words: rest.slice(at), evaluated: false };
 }
 
-// The string a shell's -c runs: its first operand after the options, when
-// one of them is -c, alone or in a cluster such as -ec. The words after it
-// are its $0, $1 and on, read into the code where it names them. Under -n
-// or -o noexec the shell only parses the string, so it runs no code.
-function shellCommandString(words) {
+// Where the string a shell's -c runs stands: its first operand after the
+// options, when one of them is -c, alone or in a cluster such as -ec. The
+// words after it are its $0, $1 and on, read into the code where it names
+// them. Under -n or -o noexec the shell only parses the string, so it runs
+// no code: -1 then, and when there is no -c.
+function shellCommandIndex(words) {
   const state = { awaiting: null, noexec: false, command: false };
   for (const [i, word] of words.entries()) {
     if (consumedAsOptionValue(word, state)) continue;
-    if (!/^[-+]/.test(word.value)) return state.command && !state.noexec ? withPositionals(word.value, words.slice(i + 1)) : null;
+    if (!/^[-+]/.test(word.value)) return state.command && !state.noexec ? i : -1;
     noteShellOption(word.value, state);
   }
-  return null;
+  return -1;
 }
 
 // A positional parameter the code of a shell's -c reads, replaced by the
@@ -1842,7 +2025,9 @@ function judgeCommand(inputOrRaw) {
   const bindings = bindingsOfSegments(extracted);
   const words = resolveCommandWords(extracted, bindings, true);
   if (words.blocked) return { exitCode: 2, stderr: `EGC Guardian BLOCKED this command: ${words.blocked}.` };
-  const segments = words.segments;
+  const reread = secondReadings(command, bindings, true);
+  if (reread.blocked) return { exitCode: 2, stderr: `EGC Guardian BLOCKED this command: ${reread.blocked}.` };
+  const segments = [...words.segments, ...reread.segments];
 
   const cli = resolveGuardianCli();
   // resolveGuardianCli() only returns falsy when all 3 of its resolution

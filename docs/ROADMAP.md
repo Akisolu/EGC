@@ -79,6 +79,7 @@ This document is the release-by-release record of EGC (Extended Global Context):
 - The memory server answers its tools from one map of handlers, and the complex production functions eslint flagged are split into named steps with no change in behavior (#1587).
 - A `${...}` expansion closes where bash closes it, past nested expansions and substitutions, and a comment ends at its newline whatever quote or backslash it holds (#1561).
 - The fact-forcing gate reads `taskset -p` and `chrt -p` as acting on a running process, so the words after them are never taken for a command (#1563).
+- Code a shell reads after the line expands it (an unquoted heredoc, `-c` or `eval` code in a word that expands) is judged once per value the line gives its variables; a value the hook cannot read fails closed (#1588).
 - Encrypted state and compressed observations are written through a temp file that is exclusive and 0600 from its creation (#1564).
 - install.ps1 reads the last line of node --version, and three tests check what they claim (#1589).
 - A memory write that meets another process's lock waits its backoff without holding up the writes behind it (#1567).
