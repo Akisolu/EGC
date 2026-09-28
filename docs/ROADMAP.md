@@ -68,6 +68,7 @@ This document is the release-by-release record of EGC (Extended Global Context):
 - The Gemini and Ollama providers retry a rate limit, a server error or a timeout up to three times with backoff, honouring Retry-After, and fail at once on anything a later attempt cannot fix (#1585).
 - The Bash hook reads the command line as the shell does to find the script it runs, and holds scripts committed in git and unchanged to the grave denials only (#1557).
 - The Bash hook and the Guardian read a shell comment as bash does: a `#` that opens a word is inert, one inside quotes or `${...}` or glued to a word is not (#1558).
+- A path claim covers the tree under it and is held under the path it names in the claiming session's project, so a claim above or inside another session's lock is refused whatever its spelling (#1586).
 - A command whose name comes from a variable the command fixes is judged by the name it resolves to; opaque sources fail closed, the environment stays advisory (#1559).
 - A command word that comes from an expansion is judged by every value it can take, in the command and in the scripts it runs; a value the hook cannot read fails closed (#1560).
 - A `${...}` expansion closes where bash closes it, past nested expansions and substitutions, and a comment ends at its newline whatever quote or backslash it holds (#1561).
