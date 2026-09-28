@@ -58,6 +58,7 @@ This document is the release-by-release record of EGC (Extended Global Context):
 - The dashboard's data routes ask for the dashboard token, which every page it serves carries (#1581).
 - GNU parallel's options are read the way parallel reads them: its own Getopt::Long table, letter case, abbreviations and optional values included (#1549).
 - The Bash hook finds the command behind a wrapper by the validator's own rules, through a shared copy that a test keeps in step with the validator (#1550).
+- The long test runners count through one tally, and the manifest install plan reads its request lists through one helper (#1582).
 - The Guardian reads through the local wrappers that run a command (setsid, taskset, chrt, unshare, nsenter, runuser, prlimit, chroot, numactl, pkexec, busybox, bwrap) by their own option tables, and denies the ones that hand a string or the words after a user to a shell (#1551).
 - The fact-forcing gate reads the wrappers in front of a destructive command through the Guardian's own tables, and every target is checked to copy both hooks with their helpers (#1552).
 - The OpenCode prompt-timeout test gets its own budget, and the gain, watch-state and CI steps stop leaking temporary directories or waiting for nothing (#1583, closes #1448).

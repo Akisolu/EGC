@@ -12,7 +12,7 @@ import path from 'node:path';
 export function rowText(value: unknown): string {
   if (typeof value === 'string') return value;
   if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
-  return value == null ? '' : JSON.stringify(value);
+  return value === null || value === undefined ? '' : JSON.stringify(value);
 }
 
 export interface BusDb {
