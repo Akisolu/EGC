@@ -75,6 +75,7 @@ This document is the release-by-release record of EGC (Extended Global Context):
 - A path claim covers the tree under it and is held under the path it names in the claiming session's project, so a claim above or inside another session's lock is refused whatever its spelling (#1586).
 - A command whose name comes from a variable the command fixes is judged by the name it resolves to; opaque sources fail closed, the environment stays advisory (#1559).
 - A command word that comes from an expansion is judged by every value it can take, in the command and in the scripts it runs; a value the hook cannot read fails closed (#1560).
+- The memory server answers its tools from one map of handlers, and the complex production functions eslint flagged are split into named steps with no change in behavior (#1587).
 - A `${...}` expansion closes where bash closes it, past nested expansions and substitutions, and a comment ends at its newline whatever quote or backslash it holds (#1561).
 - The fact-forcing gate reads `taskset -p` and `chrt -p` as acting on a running process, so the words after them are never taken for a command (#1563).
 - Encrypted state and compressed observations are written through a temp file that is exclusive and 0600 from its creation (#1564).
