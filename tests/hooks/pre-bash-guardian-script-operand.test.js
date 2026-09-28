@@ -916,6 +916,73 @@ function runTests() {
       assert.ok(oversized.stderr.includes('too large'), oversized.stderr);
     }));
 
+    record(test('a script run by its path is read like bash <file> when its #! names a shell or it has none, and another interpreter or a binary is not', () => {
+      const makeExecutable = (name, body) => {
+        const file = path.join(dir, name);
+        fs.writeFileSync(file, body);
+        fs.chmodSync(file, 0o755);
+      };
+      makeExecutable('run-me.sh', `#!/bin/bash\n${wipe} /tmp/egc-victim\n`);
+      makeExecutable('no-bang', `${wipe} /tmp/egc-victim\n`);
+      makeExecutable('env-bang', `#!/usr/bin/env -S bash -e\n${wipe} /tmp/egc-victim\n`);
+      // env reads its own options first: -u, -C and -a take the next word,
+      // -S splits its string into more words, attached or not.
+      // An option env does not know leaves the line unread, so it is read as
+      // shell; --help and --version run nothing.
+      const envBangs = ['-S -u FOO sh', '-S -uFOO sh', '-S -C /tmp bash', '-S -iu FOO sh', '-Ssh -e', '-S --unset FOO bash', '-S --unset=FOO bash',
+        '-S --chd /tmp sh', '--split-string=sh', '-u FOO bash', '-S -- A=1 sh', '-S A=1 sh', '-S -a name sh', '-S -x python3'];
+      const envNotShell = ['-S -u FOO python3', '-Snode bash', '-S --chd /tmp python3', '--help sh'];
+      envBangs.forEach((bang, i) => makeExecutable(`env-opt-${i}`, `#!/usr/bin/env ${bang}\n${wipe} /tmp/egc-victim\n`));
+      envNotShell.forEach((bang, i) => makeExecutable(`env-other-${i}`, `#!/usr/bin/env ${bang}\n${wipe} /tmp/egc-victim\n`));
+      // A #! line that names no interpreter makes the kernel refuse the file,
+      // and the calling shell then runs it as a script of its own.
+      makeExecutable('empty-bang', `#!\n${wipe} /tmp/egc-victim\n`);
+      // env -S reads quotes in its string as a shell does: "bash" is bash.
+      makeExecutable('quoted-env-bang', `#!/usr/bin/env -S "bash" -e\n${wipe} /tmp/egc-victim\n`);
+      makeExecutable('single-quoted-env-bang', `#!/usr/bin/env -S 'sh'\n${wipe} /tmp/egc-victim\n`);
+      // The kernel ignores an extension: a shell script named like a Windows
+      // program runs as the script it is everywhere but on Windows.
+      makeExecutable('disguised.exe', `#!/bin/bash\n${wipe} /tmp/egc-victim\n`);
+      makeExecutable('blank-bang', `#!  \t\n${wipe} /tmp/egc-victim\n`);
+      makeExecutable('py-tool', `#!/usr/bin/env python3\nprint("${wipe} /tmp/egc-victim")\n`);
+      makeExecutable('binary', `\u007fELF\u0002\u0001\u0001\u0000\u0000\u0000${wipe} /tmp/egc-victim\n`);
+      makeExecutable('tool.cmd', `@echo off\r\n${wipe} /tmp/egc-victim\r\n`);
+      fs.mkdirSync(path.join(dir, 'bin'), { recursive: true });
+      makeExecutable('bin/deep.sh', `#!/bin/sh\n${wipe} /tmp/egc-victim\n`);
+      const judge = command => run({ tool_name: 'Bash', tool_input: { command }, cwd: dir });
+      for (const command of [
+        './run-me.sh', JSON.stringify(path.join(dir, 'run-me.sh')), 'sudo ./run-me.sh', 'sudo -s ./run-me.sh', './no-bang',
+        './env-bang', './empty-bang', './blank-bang', './quoted-env-bang', './single-quoted-env-bang', 'bin/deep.sh', 'nohup ./run-me.sh',
+        ...(process.platform === 'win32' ? [] : ['./disguised.exe', './tool.cmd']), 'env A=1 ./run-me.sh', "echo 'x' > made.sh && ./made.sh",
+        './build.sh && ./run-me.sh', '/bin/bash notes.txt', '/usr/bin/env bash notes.txt',
+        ...envBangs.map((bang, i) => `./env-opt-${i}`),
+      ]) {
+        const result = judge(command);
+        assert.strictEqual(result.exitCode, 2, `${command}: ${JSON.stringify(result)}`);
+      }
+      // A file this user cannot read and does not own was not written by it
+      // and is left to the program it is; one it owns and made unreadable is
+      // read, which fails closed. Another owner is played by the uid.
+      makeExecutable('unreadable-tool', `${wipe} /tmp/egc-victim\n`);
+      fs.chmodSync(path.join(dir, 'unreadable-tool'), 0o111);
+      const posixUser = process.platform !== 'win32' && typeof process.getuid === 'function' && process.getuid() !== 0;
+      if (posixUser) {
+        assert.strictEqual(judge('sudo ./unreadable-tool').exitCode, 2, 'an unreadable file of its own');
+        const ownUid = process.getuid;
+        process.getuid = () => ownUid() + 1;
+        try {
+          assert.strictEqual(judge('sudo ./unreadable-tool').exitCode, 0, "an unreadable file of another owner");
+        } finally {
+          process.getuid = ownUid;
+        }
+      }
+      const unreadable = [];
+      for (const command of ['./build.sh', './py-tool', './binary', ...(process.platform === 'win32' ? ['./tool.cmd'] : []), './not-built-yet', 'make && ./a.out', 'ls ./run-me.sh', ...unreadable, ...envNotShell.map((bang, i) => `./env-other-${i}`)]) {
+        const result = judge(command);
+        assert.strictEqual(result.exitCode, 0, `${command}: ${JSON.stringify(result)}`);
+      }
+    }));
+
     record(test('a non-interpreter command with a script operand is not read', () => {
       const result = run({ tool_name: 'Bash', tool_input: { command: `cat ${denied}` }, cwd: dir });
       assert.strictEqual(result.exitCode, 0, JSON.stringify(result));

@@ -483,7 +483,12 @@ function interpreterOperands(words, cwdUnknown = null) {
   // what remains is the environment's, like $EDITOR) is not an interpreter, so
   // its operands are its own arguments, not a script to read.
   const isShellVar = head.value.startsWith('$') && SHELL_VARIABLES.has(head.value);
-  if (!isShellVar && !SHELL_INTERPRETERS.has(name)) return found([]);
+  // Any other command named by a path (./x.sh, /opt/x, dir/x) runs that file
+  // itself; readOperand reads it like `bash file` when it is a shell script.
+  // One the line has not made yet (a build's output) need not be there.
+  const direct = !isShellVar && !SHELL_INTERPRETERS.has(name);
+  if (direct && /[\\/]/.test(head.value)) return found([{ ...head, script: true, direct: true, optional: true }]);
+  if (direct) return found([]);
 
   const shell = !head.value.startsWith('$') || isShellVar;
   return found(interpreterScriptOperands(words.slice(index + 1), shell), name === 'source' || name === '.');
@@ -845,6 +850,106 @@ function readOperands(found, dirs, context) {
   return { files, blocked: null };
 }
 
+// Shells a #! line can name, directly or through env.
+const SHEBANG_SHELLS = new Set(['sh', 'bash', 'zsh', 'ksh', 'mksh', 'dash', 'ash', 'busybox']);
+const NOT_SHELL_EXTENSIONS_RE = /\.(?:cmd|bat|ps1|exe|com)$/i;
+
+// env's long options, and those of its options, short and long, that take
+// the next word as their value (-S takes one too and splits it into more
+// words).
+const ENV_LONG_OPTIONS = ['unset', 'chdir', 'argv0', 'split-string', 'ignore-environment', 'null', 'debug', 'block-signal', 'default-signal', 'ignore-signal', 'list-signal-handling', 'help', 'version'];
+const ENV_LONG_VALUE = new Set(['unset', 'chdir', 'argv0']);
+const ENV_SHORT_VALUE = new Set(['u', 'C', 'a']);
+const ENV_SHORT_FLAGS = new Set(['i', '0', 'v']);
+
+// The words env reads after one cluster of short options: `-iu NAME` takes
+// NAME, `-Ssh -e` splits `sh` into a word of its own. null for an option env
+// does not know.
+function afterEnvShort(word, rest) {
+  for (let k = 1; k < word.length; k += 1) {
+    const attached = word.slice(k + 1);
+    if (word[k] === 'S') return attached ? [attached, ...rest] : rest;
+    if (ENV_SHORT_VALUE.has(word[k])) return attached ? rest : rest.slice(1);
+    if (!ENV_SHORT_FLAGS.has(word[k])) return null;
+  }
+  return rest;
+}
+
+// The words env reads after one long option, abbreviated as getopt_long
+// allows; none after --help or --version, which run nothing. null for an
+// option env does not know.
+function afterEnvLong(word, rest) {
+  const eq = word.indexOf('=');
+  const name = eq < 0 ? word.slice(2) : word.slice(2, eq);
+  const matches = ENV_LONG_OPTIONS.filter(option => option.startsWith(name));
+  const option = matches.includes(name) ? name : matches.length === 1 && matches[0];
+  if (!option) return null;
+  if (option === 'help' || option === 'version') return [];
+  if (option === 'split-string') return eq < 0 ? rest : [word.slice(eq + 1), ...rest];
+  return ENV_LONG_VALUE.has(option) && eq < 0 ? rest.slice(1) : rest;
+}
+
+// The program env runs, read past its options and assignments; undefined
+// when it runs none, null when an option cannot be read.
+function envProgram(words) {
+  let rest = words;
+  while (rest?.length > 0) {
+    const [word, ...after] = rest;
+    if (word === '--') return after.find(operand => !operand.includes('='));
+    if (word.startsWith('--')) rest = afterEnvLong(word, after);
+    else if (word.startsWith('-')) rest = afterEnvShort(word, after);
+    else if (word.includes('=')) rest = after;
+    else return word;
+  }
+  return rest === null ? null : undefined;
+}
+
+// A word of an env -S string, read with its quotes as env reads them.
+const unquoteEnvWord = word => word.replace(/^(['"])(.*)\1$/, '$2');
+
+// A file this user cannot read and does not own was not written by it: run
+// by its path (through sudo, as root) it is left to the program it is. One
+// it owns could have been made unreadable to hide it, and is read, which
+// fails closed; so is one whose owner cannot be told.
+function unreadableRunsAsShell(file) {
+  try {
+    return typeof process.getuid !== 'function' || fs.statSync(file).uid === process.getuid();
+  } catch {
+    return true;
+  }
+}
+
+// Whether a file run by its path is a shell script: its #! line names a
+// shell, directly or through env (its -S string read with its quotes), or it
+// has none or names no interpreter, and then the calling shell runs it as a
+// script of its own. A binary and another interpreter's script are not read
+// as shell, nor on Windows a file its extension hands to another program;
+// elsewhere the kernel ignores the extension. An env line whose options
+// cannot be read is read as shell.
+function runsAsShellScript(file) {
+  if (process.platform === 'win32' && NOT_SHELL_EXTENSIONS_RE.test(file)) return false;
+  let head;
+  try {
+    const fd = fs.openSync(file, 'r');
+    try {
+      const buffer = Buffer.alloc(256);
+      head = buffer.subarray(0, fs.readSync(fd, buffer, 0, 256, 0)).toString('latin1');
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return unreadableRunsAsShell(file);
+  }
+  if (head.includes('\0')) return false;
+  if (!head.startsWith('#!')) return true;
+  const line = head.slice(2).split('\n')[0].trim();
+  if (!line) return true;
+  const words = line.split(/\s+/);
+  const program = path.basename(words[0]);
+  const run = program === 'env' ? envProgram(words.slice(1).map(unquoteEnvWord)) : program;
+  return run === null || SHEBANG_SHELLS.has(path.basename(run ?? ''));
+}
+
 // One operand of an interpreter: the script file it names, the reason it
 // cannot be inspected, or null when it names no file to read.
 function readOperand(word, context, root, base) {
@@ -854,7 +959,7 @@ function readOperand(word, context, root, base) {
   const value = beside ?? expandedOperandValue(word, context.homeKnown);
   // An argument the shell expands at run time is not the script; the
   // script itself cannot be found before it runs.
-  if (value === null) return word.script ? { blocked: `operand ${word.value} is expanded by the shell when it runs and cannot be inspected` } : null;
+  if (value === null) return word.script && !word.direct ? { blocked: `operand ${word.value} is expanded by the shell when it runs and cannot be inspected` } : null;
   const candidate = operandPath(value, root, base);
   // A script the command writes is not the file read here, wherever the
   // write sits on the line: a loop, a function called later, a background
@@ -862,8 +967,21 @@ function readOperand(word, context, root, base) {
   if (word.script && candidate !== null && (context.written.bulk || context.written.paths.has(candidate))) {
     return { blocked: `script ${word.value} may be written by this command before it runs, so what runs is not what was read; run it in a command of its own` };
   }
-  const inspected = inspectOperand({ ...word, value, expands: false, tilde: false }, root, base);
+  const inspected = inspectedFile(word, value, root, base);
   if (inspected || !word.script) return inspected;
+  return missingScript(word, context, beside, candidate);
+}
+
+// The file an operand names once inspected; a file run by its path counts
+// only when it is a shell script.
+function inspectedFile(word, value, root, base) {
+  const inspected = inspectOperand({ ...word, value, expands: false, tilde: false }, root, base);
+  return word.direct && inspected?.file && !runsAsShellScript(inspected.file) ? null : inspected;
+}
+
+// Why a script the command runs, which the hook did not find, cannot be
+// inspected; null when it need not be there.
+function missingScript(word, context, beside, candidate) {
   // A file beside the script that is not there is not one this hook read.
   if (beside !== null) return { blocked: `operand ${word.value} names ${beside}, which is not a file this hook can read` };
   // A script the command itself runs must be there to be read: one that is
