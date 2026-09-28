@@ -33,6 +33,7 @@ const path = require('node:path');
 const { resolveGuardianCli, callGuardianVerdict, guardianFailureReason, readHookInput } = require('../lib/guardian-bin');
 const { splitShellSegments, extractSubstitutionBodies, constructEnd } = require('../lib/shell-split');
 const { WRAPPER_SPECS, SHELL_KEYWORDS, readWrapperOption, runnerCommandStart, commandName } = require('../lib/wrapper-options');
+const { stdinReaderOf, producedProgram, isRedirection, takesTarget, isRuntimeOnly, isStdinPath } = require('../lib/stdin-programs');
 const { handoffCommandsOf } = require('../lib/handoff-commands');
 const { collectBindings, mergeBindings, valuesOf, commandWordChoices, quoteField, singleQuoted } = require('../lib/shell-bindings');
 const { startCwd, afterMove, CWD_CHANGERS } = require('../lib/shell-cwd');
@@ -241,7 +242,12 @@ function readShellWord(text, start) {
   }
   // `tilde`: an unquoted ~ that the shell turns into a home directory.
   // `bare`: an expansion outside quotes, whose value the shell splits.
-  return { value: word.value, globbed: /[*?[]/.test(word.code), unsure: word.unsure, expands: word.expands, bare: word.bare, tilde: word.code.startsWith('~'), start, end: i };
+  // `redirect`: a redirection the shell performs, not a quoted word that
+  // only reads like one. `braced`: an unquoted brace the shell may expand.
+  return {
+    value: word.value, globbed: /[*?[]/.test(word.code), unsure: word.unsure, expands: word.expands, bare: word.bare, tilde: word.code.startsWith('~'),
+    redirect: isRedirection(word.code), braced: /[{}]/.test(word.code), start, end: i,
+  };
 }
 
 function shellWords(segment) {
@@ -532,7 +538,14 @@ function isCommandStringFlag(value) {
 function interpreterScriptOperands(words, shell) {
   const operands = [];
   const state = { literal: false, awaiting: null, noexec: false, command: false };
-  for (const word of words) {
+  for (let i = 0; i < words.length; i += 1) {
+    const word = words[i];
+    // A redirection and its target are no operand: `bash < x.sh` reads x.sh
+    // as its input, judged with the programs a command reads there.
+    if (word.redirect) {
+      if (takesTarget(word.value)) i += 1;
+      continue;
+    }
     if (consumedAsOptionValue(word, state)) continue;
     if (!state.literal && word.value === '--') state.literal = true;
     else if (state.literal || !/^[-+]/.test(word.value)) operands.push({ ...word, script: shell && !state.noexec && !state.command && operands.length === 0, noRun: state.noexec });
@@ -612,6 +625,17 @@ function inspectOperand(operand, root, base) {
   if (!stat.isFile()) return null;
   if (stat.size > MAX_SCRIPT_BYTES) return { blocked: `script ${operand.value} is too large to analyze` };
   return { file: candidate };
+}
+
+// A path that is there but is neither a file nor a directory: a pipe, a
+// socket or a device, whose bytes are only known when they are read.
+function isSpecialFile(file) {
+  try {
+    const stat = fs.statSync(file);
+    return !stat.isFile() && !stat.isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 // Commands that can set HOME without an assignment word.
@@ -968,6 +992,8 @@ function readOperand(word, context, root, base) {
   // An argument the shell expands at run time is not the script; the
   // script itself cannot be found before it runs.
   if (value === null) return word.script && !word.direct ? { blocked: `operand ${word.value} is expanded by the shell when it runs and cannot be inspected` } : null;
+  const descriptor = descriptorOperand(word, value);
+  if (descriptor !== undefined) return descriptor;
   const candidate = operandPath(value, root, base);
   // A script the command writes is not the file read here, wherever the
   // write sits on the line: a loop, a function called later, a background
@@ -980,6 +1006,14 @@ function readOperand(word, context, root, base) {
   return missingScript(word, context, beside, candidate);
 }
 
+// A descriptor path names what the running command holds, not a file this
+// hook can open: its standard input is judged as what it is fed there, any
+// other descriptor cannot be inspected. undefined for any other path.
+function descriptorOperand(word, value) {
+  if (!isRuntimeOnly(value)) return undefined;
+  return word.script && !isStdinPath(value) ? { blocked: `script ${word.value} names a file descriptor of the running command, so what it runs cannot be inspected` } : null;
+}
+
 // The file an operand names once inspected; a file run by its path counts
 // only when it is a shell script.
 function inspectedFile(word, value, root, base) {
@@ -987,9 +1021,12 @@ function inspectedFile(word, value, root, base) {
   return word.direct && inspected?.file && !runsAsShellScript(inspected.file) ? null : inspected;
 }
 
-// Why a script the command runs, which the hook did not find, cannot be
-// inspected; null when it need not be there.
+// Why a script the command runs, which the hook did not find as a regular
+// file, cannot be inspected; null when it need not be there.
 function missingScript(word, context, beside, candidate) {
+  if (candidate !== null && candidate !== '/dev/null' && isSpecialFile(candidate)) {
+    return { blocked: `script ${word.value} is not a regular file (a pipe or a device), so what it hands the shell cannot be inspected` };
+  }
   // A file beside the script that is not there is not one this hook read.
   if (beside !== null) return { blocked: `operand ${word.value} names ${beside}, which is not a file this hook can read` };
   // A script the command itself runs must be there to be read: one that is
@@ -1535,6 +1572,134 @@ function findExecCommandsOf(line) {
   return commands;
 }
 
+// A program a command runs that this hook cannot read: the whole command
+// is refused, with the reason.
+class ProgramUnreadable extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'ProgramUnreadable';
+  }
+}
+
+const inlineCode = name => `${name} reads the program it runs from its standard input, which is inline code; write the code to a file and run the file instead`;
+const runtimeOnly = (name, source) => `${name} reads the program it runs from ${source}, which only exists while the command runs, so this hook cannot read it; save it to a file, read it, and run the file instead`;
+const expandedInput = (name, kind) => `${name} reads the program it runs from a ${kind} the shell expands when the command runs, which this hook cannot read as written; quote it (<<'EOF', <<< '...') or write the script to a file and run the file instead`;
+
+// The words of a stage, environment assignments and wrappers skipped: the
+// command it runs, first.
+function stageWords(stage) {
+  const words = shellWords(splitHeredoc(stage).command);
+  return words.slice(skipEnvAndWrappers(words));
+}
+
+const stageValues = stage => stageWords(stage).map(word => word.value);
+
+// Whether words are the text the command runs with: nothing the shell
+// expands, globs, brace-expands or reads as ~, no escape it cannot place,
+// and no quoted word that only reads like a redirection.
+function literalWords(words) {
+  return words.every(word => !word.expands && !word.globbed && !word.tilde && !word.unsure && !word.braced && (word.redirect || !isRedirection(word.value)));
+}
+
+// Whether a heredoc's body is the text the command reads: every delimiter
+// on its line is quoted, or the body holds nothing the shell expands in it.
+function literalHeredoc(line, body) {
+  if (!/[$`\\]/.test(body)) return true;
+  const delimiters = [...line.matchAll(/(?:^|[^<])<<(?!<)-?\s*(\S+)/g)].map(match => match[1]);
+  return delimiters.length > 0 && delimiters.every(delimiter => /['"\\]/.test(delimiter));
+}
+
+// The word a here-string (`<<< word`) feeds a command's standard input.
+function hereStringWord(line) {
+  const words = shellWords(line);
+  for (let i = 0; i < words.length; i += 1) {
+    if (!words[i].redirect) continue;
+    if (words[i].value === '<<<') return words[i + 1] ?? null;
+    if (words[i].value.startsWith('<<<')) return { ...words[i], value: words[i].value.slice(3) };
+  }
+  return null;
+}
+
+// What a command that reads its program on standard input is given there,
+// as the command lines to judge: a shell's or at's script, read like any
+// other, and the files it reads, as the script operands they are. An
+// interpreter of another language reading its code there is inline code,
+// and a path only the running command has cannot be read at all.
+function fedLines(reader, produced) {
+  if (reader.kind === 'interpreter') {
+    throw new ProgramUnreadable(reader.files.length > 0 ? runtimeOnly(reader.name, reader.files[0]) : inlineCode(reader.name));
+  }
+  const shell = reader.kind === 'shell' ? reader.name : 'sh';
+  if (produced.text !== undefined) return [produced.text];
+  const runtime = produced.files.find(isRuntimeOnly);
+  if (runtime !== undefined) throw new ProgramUnreadable(runtimeOnly(reader.name, runtime));
+  return produced.files.map(file => `${shell} ${singleQuoted(file)}`);
+}
+
+// What a stage writes to the pipe, when this hook can read it as written.
+function producedBy(stage) {
+  const words = stageWords(stage);
+  const { command, body } = splitHeredoc(stage);
+  if (!literalWords(words) || (body !== null && !literalHeredoc(command, body))) return null;
+  return producedProgram(words.map(word => word.value), body);
+}
+
+// The stages of a pipeline, a heredoc's body given to the stage whose
+// operator opened it: in `cat <<EOF | sh` the body is what cat reads, and sh
+// reads cat's output, not a script operand on the line after it.
+function pipelineStages(pipeline) {
+  const { command: line, body } = splitHeredoc(pipeline);
+  if (body === null) return splitShellSegments(pipeline, { splitOnPipe: true, stripComments: true });
+  const stages = splitShellSegments(line, { splitOnPipe: true, stripComments: true });
+  const owner = stages.findIndex(stage => HEREDOC_OPERATOR_RE.test(stage));
+  return stages.map((stage, i) => (i === owner ? `${stage}\n${body}` : stage));
+}
+
+// The programs each stage of the pipelines in `command` hands the next one
+// as the program that one reads on standard input.
+function fedPrograms(command) {
+  const fed = [];
+  for (const pipeline of splitShellSegments(command, { stripComments: true })) {
+    const stages = pipelineStages(pipeline);
+    for (let s = 1; s < stages.length; s += 1) {
+      const reader = stdinReaderOf(stageValues(stages[s]));
+      // A reader with input of its own (a file, a heredoc, a here-string)
+      // runs that, judged with the stage, not what the stage before writes.
+      if (reader === null || reader.files.length > 0 || splitHeredoc(stages[s]).body !== null || hereStringWord(stages[s]) !== null) continue;
+      const produced = producedBy(stages[s - 1]);
+      if (produced === null && reader.kind !== 'interpreter') {
+        throw new ProgramUnreadable(`${reader.name} reads the program it runs from the output of '${stageValues(stages[s - 1]).join(' ')}', which this hook cannot read; save that output to a file, read it, and run the file instead`);
+      }
+      fed.push(...fedLines(reader, produced ?? { text: '' }));
+    }
+  }
+  return fed;
+}
+
+// The text a stage's own heredoc or here-string feeds its reader, refused
+// when the shell expands it before the reader gets it.
+function ownInputText(reader, line, body) {
+  const here = hereStringWord(line);
+  if (here !== null) {
+    if (here.expands || here.unsure || here.tilde) throw new ProgramUnreadable(expandedInput(reader.name, 'here-string'));
+    return here.value;
+  }
+  if (body === null) return null;
+  if (!literalHeredoc(line, body)) throw new ProgramUnreadable(expandedInput(reader.name, 'heredoc'));
+  return body;
+}
+
+// The program a stage's own input hands the command it runs: a heredoc or
+// a here-string, and the files it reads instead (at's scripts, the file a
+// shell's input comes from).
+function ownFedPrograms(line, body) {
+  const reader = stdinReaderOf(stageValues(line));
+  if (reader === null) return [];
+  const text = ownInputText(reader, line, body);
+  const programs = text === null ? [] : fedLines(reader, { text });
+  return reader.files.length === 0 ? programs : [...programs, ...fedLines(reader, { files: reader.files })];
+}
+
 // The command lines this stage hands to another process (a terminal
 // multiplexer, a remote shell, a container) to run.
 function handedOffCommandsOf(line) {
@@ -1557,7 +1722,7 @@ function segmentsOfStage(raw, depth) {
   const trimmed = line.trim();
   const inline = inlineShellCodeOf(line);
   let own = trimmed ? [trimmed] : [];
-  for (const code of [...(inline === null ? [] : [inline]), ...findExecCommandsOf(line), ...handedOffCommandsOf(line)]) {
+  for (const code of [...(inline === null ? [] : [inline]), ...findExecCommandsOf(line), ...handedOffCommandsOf(line), ...ownFedPrograms(line, readsItsInputAsCode(line) ? null : body)]) {
     own = own === null ? null : withNested(own, code, depth);
   }
   if (own === null) return null;
@@ -1579,7 +1744,7 @@ function extractSegments(rawCommand, depth = 0) {
   if (bodies.length > 0 && depth >= MAX_SUBSTITUTION_DEPTH) return null;
 
   const segments = [];
-  for (const raw of splitShellSegments(command, { splitOnPipe: true, stripComments: true })) {
+  for (const raw of splitShellSegments(command, { stripComments: true }).flatMap(pipelineStages)) {
     const stage = segmentsOfStage(raw, depth);
     if (stage === null) return null;
     segments.push(...stage);
@@ -1587,6 +1752,12 @@ function extractSegments(rawCommand, depth = 0) {
 
   for (const body of bodies) {
     const nested = extractSegments(body, depth + 1);
+    if (nested === null) return null;
+    segments.push(...nested);
+  }
+
+  for (const program of fedPrograms(command)) {
+    const nested = withNested([], program, depth);
     if (nested === null) return null;
     segments.push(...nested);
   }
@@ -1640,6 +1811,15 @@ function withoutVerdict(failure) {
 // run-with-flags reports it.
 function run(inputOrRaw, options = {}) {
   if (options.truncated) return { exitCode: 2, stderr: OVER_LIMIT };
+  try {
+    return judgeCommand(inputOrRaw);
+  } catch (error) {
+    if (error instanceof ProgramUnreadable) return { exitCode: 2, stderr: `EGC Guardian BLOCKED this command: ${error.message}.` };
+    throw error;
+  }
+}
+
+function judgeCommand(inputOrRaw) {
   const input = parseInput(inputOrRaw);
   const command = input?.tool_input?.command;
   if (!command || typeof command !== 'string') return { exitCode: 0 };
@@ -1712,7 +1892,7 @@ function run(inputOrRaw, options = {}) {
   return { exitCode: 0 };
 }
 
-module.exports = { run, extractSegments, isAdvisory, bindingsOfSegments };
+module.exports = { run, extractSegments, isAdvisory, bindingsOfSegments, ProgramUnreadable };
 
 if (require.main === module) {
   readHookInput(({ raw, truncated }) => {
