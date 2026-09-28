@@ -523,10 +523,10 @@ const SYSTEM_PROGRAM_DIRS = ['/usr/', '/bin/', '/sbin/', '/opt/'];
 const PLAIN_FLAG_RE = /^--?[A-Za-z][\w-]*(?:=[\w.,:-]*)?$/;
 // A file or a directory git writes to: its trace, its index, its objects.
 const GIT_PATH_ENV_VAR_RE = /^GIT_(?:TRACE\w*|INDEX_FILE|WORK_TREE|OBJECT_DIRECTORY)$/;
-// The repository git reads its config and hooks from: a .git directory,
-// whose config is protected, and no other.
+// The repository git reads its config and hooks from: a .git or <name>.git
+// directory, whose config is protected (isTrustedGitDirectory, the rule
+// --git-dir and the directory git finds are held to), and no other.
 const REPOSITORY_ENV_VARS = new Set(['GIT_DIR', 'GIT_COMMON_DIR']);
-const GIT_DIRECTORY_RE = /(?:^|[\\/])\.git[\\/]?$/;
 // Where git and gpg, which git runs to sign, find their config, which can
 // name commands they run.
 const CONFIG_HOME_ENV_VARS = new Set(['HOME', 'XDG_CONFIG_HOME', 'GNUPGHOME']);
@@ -556,14 +556,15 @@ function programValueDenied(text: string, alone: boolean): boolean {
 // is protected, a config home for the git command it prefixes, less options
 // that run a command, or a pager or an editor that is inline code, a script
 // named by its path or a program handed an argument. null when it is free.
-function envValueDenial(name: string, value: string, command: string | undefined, persists: boolean): string | null {
+function envValueDenial(name: string, value: string, command: string | undefined, persists: boolean, cwd?: string): string | null {
   const upper = name.toUpperCase();
   const text = stripQuotes(value);
   if (GIT_PATH_ENV_VAR_RE.test(upper) && isProtectedPath(text)) {
     return `'${name}' makes git write to the protected path ${text}, which is forbidden`;
   }
-  if (REPOSITORY_ENV_VARS.has(upper) && !GIT_DIRECTORY_RE.test(text)) {
-    return `'${name}' points git at ${text}, a repository whose config this line can choose, which is forbidden: name a .git directory`;
+  // Read from where the command runs, so a relative link is followed there.
+  if (REPOSITORY_ENV_VARS.has(upper) && !isTrustedGitDirectory(followedGitDirectory(path.resolve(cwd ?? process.cwd(), expandHome(text))))) {
+    return `'${name}' points git at ${text}, a repository whose config this line can choose, which is forbidden: name a .git or <name>.git directory`;
   }
   // When it persists (export, a bare assignment) it holds for the git
   // commands later on the line; git's own programs (git-upload-pack) read
@@ -609,14 +610,14 @@ function commandThroughWrappers(tokens: string[]): string | undefined {
 
 // The block a `VAR=value` or `export VAR=value` gets, if any; `command` is
 // the command the assignment prefixes, when there is one.
-function envAssignmentBlock(name: string, value: string, verb: string, command: string | undefined, persists: boolean): ValidationResultLike | null {
+function envAssignmentBlock(name: string, value: string, verb: string, command: string | undefined, persists: boolean, cwd?: string): ValidationResultLike | null {
   if (isDangerousEnvVarName(name)) {
     return { allowed: false, reason: `${verb} '${name}' persists a git execution/config override and is forbidden`, trust_level: 'DANGEROUS' };
   }
   if (CODE_INJECTION_ENV_VARS.has(name.toUpperCase())) {
     return { allowed: false, reason: `${verb} '${name}' makes the next program run code this line chooses before its own (a startup script or a library), which is forbidden`, trust_level: 'DANGEROUS' };
   }
-  const reason = envValueDenial(name, value, command, persists);
+  const reason = envValueDenial(name, value, command, persists, cwd);
   return reason ? { allowed: false, reason, trust_level: 'DANGEROUS' } : null;
 }
 
@@ -647,14 +648,14 @@ interface UnwrapStep {
 // command that follows, so a dangerous git-persistence variable here is a
 // hard block rather than a silent strip: stripping it would judge the
 // command by a name that never actually ran with that override in effect.
-function tryUnwrapEnvAssignment(current: string[]): UnwrapStep | null {
+function tryUnwrapEnvAssignment(current: string[], cwd?: string): UnwrapStep | null {
   const envMatch = ENV_ASSIGNMENT_RE.exec(current[0]);
   if (!envMatch) return null;
   let start = 0;
   while (start < current.length && ENV_ASSIGNMENT_RE.test(current[start])) start += 1;
   const rest = current.slice(start);
   const command = commandThroughWrappers(rest);
-  const blocked = envAssignmentBlock(envMatch[1], current[0].slice(envMatch[0].length), 'setting', command, rest.length === 0);
+  const blocked = envAssignmentBlock(envMatch[1], current[0].slice(envMatch[0].length), 'setting', command, rest.length === 0, cwd);
   return blocked ? { blocked } : { remaining: current.slice(1) };
 }
 
@@ -667,7 +668,7 @@ function tryUnwrapEnvAssignment(current: string[]): UnwrapStep | null {
 // other bash builtin — skipping straight to current[1] missed
 // `export -- GIT_SSH_COMMAND=...`, which real bash still treats as an
 // assignment despite the leading `--`.
-function tryUnwrapExport(current: string[]): UnwrapStep | null {
+function tryUnwrapExport(current: string[], cwd?: string): UnwrapStep | null {
   if (bareToken(current[0]) !== 'export' || current.length <= 1) return null;
 
   let idx = 1;
@@ -683,7 +684,7 @@ function tryUnwrapExport(current: string[]): UnwrapStep | null {
   const exportMatch = ENV_ASSIGNMENT_RE.exec(assignment);
   if (!exportMatch) return null;
 
-  const blocked = envAssignmentBlock(exportMatch[1], assignment.slice(exportMatch[0].length), 'exporting', undefined, true);
+  const blocked = envAssignmentBlock(exportMatch[1], assignment.slice(exportMatch[0].length), 'exporting', undefined, true, cwd);
   return blocked ? { blocked } : { remaining: current.slice(idx + 1) };
 }
 
@@ -922,13 +923,13 @@ function tryUnwrapEgcExecutor(current: string[]): UnwrapStep | null {
   return { remaining: rest };
 }
 
-function unwrapLeadingConstructs(tokens: string[]): UnwrapResult {
+function unwrapLeadingConstructs(tokens: string[], cwd?: string): UnwrapResult {
   let current = tokens;
   let changed = true;
   while (changed && current.length > 0) {
     changed = false;
 
-    const step = tryUnwrapEnvAssignment(current) ?? tryUnwrapExport(current) ?? tryUnwrapEgcExecutor(current) ?? tryUnwrapWrapper(current) ?? tryUnwrapShellKeyword(current);
+    const step = tryUnwrapEnvAssignment(current, cwd) ?? tryUnwrapExport(current, cwd) ?? tryUnwrapEgcExecutor(current) ?? tryUnwrapWrapper(current) ?? tryUnwrapShellKeyword(current);
     if (step) {
       if (step.blocked) return { tokens: [], blocked: step.blocked };
       current = step.remaining as string[];
@@ -1309,15 +1310,6 @@ export const PROTECTED_FILE_PATTERNS: RegExp[] = [
   /(^|[\\/])\.zprofile$/,
   /(^|[\\/])\.profile$/,
   /(^|[\\/])\.gitconfig$/,
-  // A hook planted directly in .git/hooks/ fires on the next matching git
-  // operation (pre-commit, pre-push, ...) without touching any config file
-  // at all — the same persistence effect as the core.hooksPath/git-config
-  // checks above, via a path validateWrite previously never inspected.
-  // .git/config is the repo-local counterpart of ~/.gitconfig above; both
-  // can carry the same dangerous keys checkGitConfigWrite denies when set
-  // through the `git config` CLI, so a raw file write must be denied too.
-  /(^|[\\/])\.git[\\/]hooks([\\/]|$)/,
-  /(^|[\\/])\.git[\\/]config$/,
   // A disk or memory device holds every file on the disk, secrets included:
   // reading one reads them all and writing one overwrites them. The
   // character devices commands use every day (null, zero, random, urandom,
@@ -1460,6 +1452,50 @@ function expandHome(p: string): string {
   return parameter ? path.join(os.homedir(), p.slice(parameter[0].length)) : p;
 }
 
+// The paths of a git directory that decide what git runs: its config (the
+// repo-local counterpart of ~/.gitconfig, which can carry every key
+// checkGitConfigWrite denies through the CLI), config.worktree, commondir
+// (which names the directory whose config git loads) and any hook, which
+// fires on the next matching git operation without a config change at
+// all. The directory itself, and the ones it keeps for linked work trees
+// (worktrees/) and submodules (modules/, which may nest), are protected
+// whole: a directory copied, synced or linked there brings a config of its
+// own.
+const GIT_CONTROL_FILES = new Set(['config', 'config.worktree', 'commondir']);
+const GIT_CONTROL_DIRS = new Set(['hooks', 'worktrees', 'modules']);
+
+function isGitControlPath(rest: string[], regularFile: boolean): boolean {
+  if (rest.length === 0) return !regularFile;
+  if (GIT_CONTROL_DIRS.has(rest[0])) return true;
+  return rest.length === 1 && GIT_CONTROL_FILES.has(rest[0]);
+}
+
+// A git directory is one named `.git` or `<name>.git`: only there are its
+// control files protected from a write, whatever repository they belong to.
+// A path so named is one, or may become one, unless it is a regular file
+// already (`regularFile`): writing that makes no git directory.
+function isGitControlFile(candidate: string, regularFile = false): boolean {
+  const parts = candidate.split(/[\\/]/);
+  return parts.some((part, i) => part.endsWith('.git') && isGitControlPath(parts.slice(i + 1), regularFile));
+}
+
+function isRegularFile(p: string): boolean {
+  try {
+    return fs.lstatSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
+
+// Whether git may use `dir` as its git directory: its config is protected
+// from a write, and wherever it is, so are its hooks, so nothing planted
+// there runs. Where it really is counts as well as how it is named: a link
+// named x.git to another directory leads git to that directory's config.
+function isTrustedGitDirectory(dir: string): boolean {
+  const protectedConfig = (place: string) => isGitControlFile(path.join(foldCase(place), 'config'));
+  return protectedConfig(dir) && protectedConfig(resolveRealOrLexical(path.resolve(dir)));
+}
+
 export function isProtectedPath(p: string, baseDir: string = process.cwd()): boolean {
   // Trim first: a trailing newline (routine for anything piped through
   // `echo`) or stray whitespace survives path.resolve() into the final
@@ -1494,7 +1530,7 @@ export function isProtectedPath(p: string, baseDir: string = process.cwd()): boo
     }
   }
 
-  return false;
+  return isGitControlFile(candidate, isRegularFile(normalizedP));
 }
 
 // Reading and writing carry different risk, and treating them alike is what
@@ -1544,8 +1580,6 @@ export const READ_SAFE_PATHS: string[] = buildReadSafePaths();
 const READ_SAFE_FILE_PATTERNS: RegExp[] = [
   /(^|[\\/])\.(bashrc|zshrc|bash_profile|zprofile|profile)$/,
   /(^|[\\/])\.gitconfig$/,
-  /(^|[\\/])\.git[\\/](config|hooks)$/,
-  /(^|[\\/])\.git[\\/]hooks[\\/]/,
 ];
 
 function isUnder(candidate: string, parent: string): boolean {
@@ -1579,7 +1613,9 @@ export function isReadDeniedPath(p: string, baseDir: string = process.cwd()): bo
   // Folded on the same terms as the denial side: where the filesystem opens
   // ~/.BASHRC and ~/.bashrc as one file, both spellings have to be readable,
   // or the case fix would have quietly turned a harmless read into a denial.
-  return !READ_SAFE_FILE_PATTERNS.some(pattern => pattern.test(foldCase(normalizedP)));
+  // A git directory's config and hooks are persistence too.
+  const folded = foldCase(normalizedP);
+  return !READ_SAFE_FILE_PATTERNS.some(pattern => pattern.test(folded)) && !isGitControlFile(folded);
 }
 
 export interface ValidationResult {
@@ -2226,6 +2262,80 @@ function gitPlaces(globals: string[], cwd?: string): { dir: string; top: string 
   return { dir, top: top ?? nearestGitTop(dir) };
 }
 
+// Whether `dir` is a git directory as git recognizes one: HEAD, objects and
+// refs. A git directory made by hand, its config written first, counts.
+function isGitDirectory(dir: string): boolean {
+  try {
+    return fs.statSync(path.join(dir, 'HEAD')).isFile()
+      && fs.statSync(path.join(dir, 'objects')).isDirectory()
+      && fs.statSync(path.join(dir, 'refs')).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+// The directory a `.git` file names, relative to the file: git reads it
+// only when the file starts with `gitdir: `, and refuses any other.
+const GITFILE_PREFIX = 'gitdir: ';
+
+function gitfileTarget(file: string): string | null {
+  try {
+    if (!fs.statSync(file).isFile()) return null;
+    const [first] = fs.readFileSync(file, 'utf8').split('\n');
+    if (!first.startsWith(GITFILE_PREFIX)) return null;
+    return path.resolve(path.dirname(file), first.slice(GITFILE_PREFIX.length).trim());
+  } catch {
+    return null;
+  }
+}
+
+// A git directory named outright (--git-dir, GIT_DIR) that is a file git
+// reads as a .git file, following its gitdir: line to the directory it uses.
+function followedGitDirectory(dir: string): string {
+  return gitfileTarget(dir) ?? dir;
+}
+
+// The git directory git finds up from `dir`, in git's order at each level:
+// a `.git` directory it recognizes, a `.git` file's gitdir:, then the
+// level itself as a bare repository. null when there is none.
+function discoveredGitDirectory(dir: string): string | null {
+  for (let current = dir; ; current = path.dirname(current)) {
+    const dotGit = path.join(current, '.git');
+    if (isGitDirectory(dotGit)) return dotGit;
+    const linked = gitfileTarget(dotGit);
+    if (linked !== null) return linked;
+    if (isGitDirectory(current)) return current;
+    if (path.dirname(current) === current) return null;
+  }
+}
+
+// The last --git-dir among git's global options, as written.
+function namedGitDirectory(globals: string[]): string | undefined {
+  let named: string | undefined;
+  for (let i = 0; i < globals.length; i++) {
+    const option = stripQuotes(globals[i]);
+    if (option === '--git-dir' && globals[i + 1] !== undefined) named = stripQuotes(globals[i + 1]);
+    else if (option.startsWith('--git-dir=')) named = option.slice('--git-dir='.length);
+  }
+  return named;
+}
+
+// git loads the config and runs the hooks of the git directory it uses,
+// named by --git-dir or found up from where it runs. One outside the .git
+// convention has neither protected from a write, so what was planted there
+// would run: git is refused it.
+function checkGitDirectory(globals: string[], cwd?: string): ValidationResult | null {
+  const { dir } = gitPlaces(globals, cwd);
+  const named = namedGitDirectory(globals);
+  const gitDir = named === undefined ? discoveredGitDirectory(dir) : followedGitDirectory(path.resolve(dir, expandHome(named)));
+  if (gitDir === null || isTrustedGitDirectory(gitDir)) return null;
+  return {
+    allowed: false,
+    reason: `git would load the config and run the hooks of '${gitDir}', a git directory not named .git or <name>.git, where nothing protects them from a write, and is forbidden`,
+    trust_level: 'DANGEROUS',
+  };
+}
+
 // The files that <rev>:<path>, :<stage>:<path> and :<path> objects among
 // `operands` name in the work tree: git reads <path> from the top of the
 // tree, or from where it runs when <path> starts with ./ or ../. A <path>
@@ -2509,6 +2619,8 @@ function validateGitArgs(args: string[], cwd?: string): ValidationResult {
   if (pathDenial) return pathDenial;
 
   if (subcommandIdx < 0) return { allowed: true, trust_level: 'SAFE_READONLY' };
+  const directoryDenial = checkGitDirectory(args.slice(0, subcommandIdx), cwd);
+  if (directoryDenial) return directoryDenial;
   const subcommand = bareToken(args[subcommandIdx]);
   const rest = args.slice(subcommandIdx + 1);
   const fileDenial = checkGitFileOperands(subcommand, rest, cwd);
@@ -3062,7 +3174,7 @@ function validateCommandVerdict(command: string, cwd?: string): ValidationResult
       trust_level: 'DANGEROUS',
     };
   }
-  const unwrapped = unwrapLeadingConstructs(expandedTokens);
+  const unwrapped = unwrapLeadingConstructs(expandedTokens, cwd);
   if (unwrapped.blocked) return unwrapped.blocked as ValidationResult;
   const tokens = unwrapped.tokens;
   if (tokens.length === 0) {
