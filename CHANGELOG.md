@@ -6,6 +6,8 @@ All notable changes to EGC are documented here.
 
 ### Fixed
 
+- **simple-git 4 lands with the named import the new major exports** (#1647): the new major removed the default export the memory server's GitBackend consumed, and the root-only Dependabot bump would have shipped a runtime crash in the team memory sync behind a green CI; both trees move to ^4.0.2 together and the import follows the named export 3.x also ships.
+
 - **The Python test dependencies clear the urllib3 advisories of 2026-09-30** (#1645): pip-audit flags CVE-2026-97687, CVE-2026-97688 and CVE-2026-97689 on urllib3 2.7.0, pulled in through requests and types-requests, and the audit gate turned the CI red on every branch; the pin moves to 2.8.0, the fixed release, with the hashes from PyPI.
 
 - **Antigravity finds the EGC servers again** (#1611): the Antigravity CLI, the Antigravity IDE and Antigravity 2.0 read their MCP servers from the shared `~/.gemini/config/mcp_config.json`, and the CLI stopped opening `~/.gemini/antigravity-cli/mcp_config.json` once it migrated its data. #1502 took the shared file off the registration list while retiring Gemini CLI, because it was labelled as that tool's, so a fresh install registered egc-guardian and egc-memory only in the file Antigravity no longer reads. `egc init` and both installers now register the two servers in the shared file whenever any Antigravity surface is installed (`~/.gemini/config`, `antigravity`, `antigravity-cli` or `antigravity-ide`), creating the directory for an IDE-only install, and keep the CLI's pre-migration file for installs that still read it. The Guardian's trusted-file comments and tests name the file for what it is.
