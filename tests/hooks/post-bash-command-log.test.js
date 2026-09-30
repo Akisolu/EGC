@@ -12,6 +12,7 @@ const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const { CLI_TIMEOUT_MS } = require('../fixtures/subprocess-timeouts');
+const { withoutHarnessVariables } = require('../fixtures/harness-variables');
 
 const HOOK = path.join(__dirname, '..', '..', 'scripts', 'hooks', 'post-bash-command-log.js');
 const { sanitizeCommand } = require(HOOK);
@@ -21,13 +22,15 @@ function permissionBitsEnforced() {
   return !(typeof process.getuid === 'function' && process.getuid() === 0);
 }
 
+// The harness variables and EGC_DIR would pin the log's directory whatever
+// the synthetic home holds; the hook is exercised on the home alone.
 function runHook(home, command, mode = 'audit') {
   const input = JSON.stringify({ tool_name: 'Bash', tool_input: { command } });
   return spawnSync(process.execPath, [HOOK, mode], {
     input,
     encoding: 'utf8',
     timeout: CLI_TIMEOUT_MS,
-    env: { ...process.env, HOME: home, USERPROFILE: home },
+    env: withoutHarnessVariables({ ...process.env, HOME: home, USERPROFILE: home }),
   });
 }
 
@@ -40,6 +43,26 @@ function test(name, fn) {
     console.log(`  ✗ ${name}`);
     console.log(`    Error: ${error.message}`);
     return false;
+  }
+}
+
+// One test's outcome as counters, so runTests (at the analyzer's
+// cognitive-complexity limit) adds a case without another if/else pair.
+function tallied(name, fn) {
+  const ok = test(name, fn);
+  return { passed: ok ? 1 : 0, failed: ok ? 0 : 1 };
+}
+
+function assertLogFollowsToolDirectory() {
+  const toolHome = fs.mkdtempSync(path.join(os.tmpdir(), 'post-bash-command-log-claude-'));
+  try {
+    fs.mkdirSync(path.join(toolHome, '.claude'), { recursive: true });
+    const result = runHook(toolHome, 'git status', 'cost');
+    assert.strictEqual(result.status, 0, result.stderr);
+    assert.ok(fs.existsSync(path.join(toolHome, '.claude', 'cost-tracker.log')), 'a home with Claude Code installed keeps the cost log under ~/.claude, where the EGC tools look');
+    assert.ok(!fs.existsSync(path.join(toolHome, '.gemini')), 'nothing is written under a ~/.gemini that no tool owns');
+  } finally {
+    fs.rmSync(toolHome, { recursive: true, force: true });
   }
 }
 
@@ -211,8 +234,10 @@ function runTests() {
     }
   })) passed++; else failed++;
 
+  // The log lands in the EGC directory of the tool in use (getEGCDir in
+  // scripts/lib/utils.js): ~/.egc on a home where no tool is installed.
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'post-bash-command-log-'));
-  const logFile = path.join(home, '.gemini', 'bash-commands.log');
+  const logFile = path.join(home, '.egc', 'bash-commands.log');
   try {
     if (test('the hook logs a redacted line and passes its input through unchanged', () => {
       const result = runHook(home, 'curl -H "Authorization: Bearer abc.def.ghi" https://api.example.test');
@@ -235,6 +260,12 @@ function runTests() {
       assert.strictEqual(result.status, 0, result.stderr);
       assert.strictEqual(fs.statSync(logFile).mode & 0o777, 0o600, 'an existing world-readable log must be tightened');
     })) passed++; else failed++;
+
+    const followsToolOutcome = tallied('the log follows the EGC directory of the tool in use, not a fixed ~/.gemini', () => {
+      assertLogFollowsToolDirectory();
+    });
+    passed += followsToolOutcome.passed;
+    failed += followsToolOutcome.failed;
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

@@ -3,6 +3,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const { withoutHarnessVariables } = require('../fixtures/harness-variables');
 
 const scriptPath = path.join(__dirname, '..', '..', 'scripts', 'hooks', 'post-bash-command-log.js');
 const { sanitizeCommand } = require(scriptPath);
@@ -19,15 +20,13 @@ function test(name, fn) {
   }
 }
 
+// The harness variables and EGC_DIR would pin the logs' directory whatever
+// the synthetic home holds; the hook is exercised on the home alone.
 function runHook(mode, payload, homeDir) {
   return spawnSync('node', [scriptPath, mode], {
     input: JSON.stringify(payload),
     encoding: 'utf8',
-    env: {
-      ...process.env,
-      HOME: homeDir,
-      USERPROFILE: homeDir,
-    },
+    env: withoutHarnessVariables({ ...process.env, HOME: homeDir, USERPROFILE: homeDir }),
   });
 }
 
@@ -66,7 +65,8 @@ if (
       assert.strictEqual(result.status, 0, result.stdout + result.stderr);
       assert.strictEqual(result.stdout, JSON.stringify(payload));
 
-      const logFile = path.join(homeDir, '.gemini', 'bash-commands.log');
+      // The EGC directory of a home where no tool is installed: ~/.egc.
+      const logFile = path.join(homeDir, '.egc', 'bash-commands.log');
       const logContent = fs.readFileSync(logFile, 'utf8');
       assert.ok(logContent.includes('--token <REDACTED>'));
       assert.ok(!logContent.includes('abc123'));
@@ -91,7 +91,7 @@ if (
       const result = runHook('cost', payload, homeDir);
       assert.strictEqual(result.status, 0, result.stdout + result.stderr);
 
-      const logFile = path.join(homeDir, '.gemini', 'cost-tracker.log');
+      const logFile = path.join(homeDir, '.egc', 'cost-tracker.log');
       const logContent = fs.readFileSync(logFile, 'utf8');
       assert.match(logContent, /tool=Bash command=npm publish/);
     } finally {
