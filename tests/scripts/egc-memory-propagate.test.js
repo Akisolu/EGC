@@ -544,6 +544,29 @@ async function runLinkTests(args) {
     }));
   }
 
+  // Devin Desktop loads .devin/rules/ and .windsurf/rules/ alike, so there
+  // is exactly one mirror: under .windsurf/ while it exists, under .devin/
+  // (with the trigger frontmatter) in a project on .devin/ alone.
+  tally(await test('the Devin Desktop mirror is single: .windsurf/ while it exists, .devin/ with the trigger frontmatter otherwise', () => {
+    const both = mktemp();
+    const devinOnly = mktemp();
+    try {
+      fs.mkdirSync(path.join(both, '.devin'));
+      fs.mkdirSync(path.join(both, '.windsurf'));
+      const mixed = propagateStateToTools({ projectPath: both, ...args });
+      assert.ok(mixed.windsurf.includes(path.join('.windsurf', 'rules', 'egc-context.md')), 'the mirror stays under .windsurf/');
+      assert.ok(!fs.existsSync(path.join(both, '.devin', 'rules', 'egc-context.md')), 'no second copy that would load twice');
+
+      fs.mkdirSync(path.join(devinOnly, '.devin'));
+      const devin = propagateStateToTools({ projectPath: devinOnly, ...args });
+      assert.ok(devin.windsurf.includes(path.join('.devin', 'rules', 'egc-context.md')), 'a .devin-only project gets it under .devin/');
+      assert.ok(fs.readFileSync(devin.windsurf, 'utf-8').startsWith('---\ntrigger: always_on\n---'), 'a fresh .devin rule file declares its activation mode');
+    } finally {
+      cleanup(both);
+      cleanup(devinOnly);
+    }
+  }));
+
   // A junction needs no privilege on Windows and is an ordinary link
   // elsewhere, so the folder cases run on every runner.
   tally(await test('writes nothing into a tool folder that is a link', () => {

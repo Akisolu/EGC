@@ -99,6 +99,31 @@ async function runTests() {
     }
   })) passed++; else failed++;
 
+  // Branchless tally: runTests sits at the complexity ceiling and one more
+  // if/else would breach it.
+  const tally = (ok) => { ok ? passed++ : failed++; };
+
+  tally(await test('the windsurf resolver watches the one mirror EGC writes: .windsurf/ while it exists, .devin/ in a project on .devin/ alone', () => {
+    const { TOOL_FILE_RESOLVERS } = require('../../scripts/lib/watch-state');
+    const both = mktemp();
+    const devinOnly = mktemp();
+    try {
+      const legacyFile = path.join(both, '.windsurf', 'rules', 'egc-context.md');
+      fs.mkdirSync(path.dirname(legacyFile), { recursive: true });
+      fs.writeFileSync(legacyFile, '<!-- egc:start -->\nx\n<!-- egc:end -->\n');
+      fs.mkdirSync(path.join(both, '.devin', 'rules'), { recursive: true });
+      assert.strictEqual(TOOL_FILE_RESOLVERS.windsurf(both), legacyFile, 'with both directories the .windsurf/ mirror is the watched one');
+
+      const devinFile = path.join(devinOnly, '.devin', 'rules', 'egc-context.md');
+      fs.mkdirSync(path.dirname(devinFile), { recursive: true });
+      fs.writeFileSync(devinFile, '---\ntrigger: always_on\n---\n\n<!-- egc:start -->\nx\n<!-- egc:end -->\n');
+      assert.strictEqual(TOOL_FILE_RESOLVERS.windsurf(devinOnly), devinFile, 'a .devin-only project watches the .devin mirror');
+    } finally {
+      cleanup(both);
+      cleanup(devinOnly);
+    }
+  }));
+
   if (await test('StateWatcher.start returns count of discovered tool files', () => {
     const dir = mktemp();
     try {

@@ -261,6 +261,49 @@ function runTests() {
     }
   }));
 
+  // Devin Desktop loads .devin/rules/ and .windsurf/rules/ alike, so a
+  // workspace with both gets exactly one mirror: a second copy would load
+  // twice and go stale.
+  tally(test('a workspace with both .devin/ and .windsurf/ keeps one mirror, under .windsurf/', () => {
+    const dir = mktemp();
+    try {
+      fs.mkdirSync(path.join(dir, '.devin'));
+      fs.mkdirSync(path.join(dir, '.windsurf'));
+      const result = propagateStateContent(dir, SAMPLE_STATE);
+      assert.ok(result.windsurf, 'the Devin Desktop mirror is reported');
+      assert.ok(result.windsurf.includes(path.join('.windsurf', 'rules', 'egc-context.md')), 'the mirror stays where it was, which Devin Desktop still loads');
+      assert.ok(!fs.existsSync(path.join(dir, '.devin', 'rules', 'egc-context.md')), 'no second copy that would load twice');
+      const content = fs.readFileSync(result.windsurf, 'utf-8');
+      assert.ok(content.startsWith('<!-- egc:start -->'), 'the legacy mirror keeps its shape');
+    } finally {
+      cleanup(dir);
+    }
+  }));
+
+  tally(test('a .devin-only workspace gets the context with the trigger frontmatter', () => {
+    const dir = mktemp();
+    try {
+      fs.mkdirSync(path.join(dir, '.devin'));
+      const result = propagateStateContent(dir, SAMPLE_STATE);
+      assert.ok(result.windsurf.includes(path.join('.devin', 'rules', 'egc-context.md')));
+      assert.ok(fs.readFileSync(result.windsurf, 'utf-8').startsWith('---\ntrigger: always_on\n---'));
+    } finally {
+      cleanup(dir);
+    }
+  }));
+
+  tally(test('a .windsurf-only workspace keeps its legacy context file byte-shape (no frontmatter injected)', () => {
+    const dir = mktemp();
+    try {
+      fs.mkdirSync(path.join(dir, '.windsurf'));
+      const result = propagateStateContent(dir, SAMPLE_STATE);
+      assert.ok(result.windsurf.includes(path.join('.windsurf', 'rules', 'egc-context.md')));
+      assert.ok(fs.readFileSync(result.windsurf, 'utf-8').startsWith('<!-- egc:start -->'), 'the legacy file starts at the marker, as before');
+    } finally {
+      cleanup(dir);
+    }
+  }));
+
   tally(test('the generated and shipped mirrors route a decision to update_state and recall it from get_state first (#1524)', () => {
     const dir = mktemp();
     try {

@@ -309,21 +309,40 @@ function writeGeminiContext(projectPath: string, block: string): string | null {
   return filePath;
 }
 
+// Devin Desktop workspace rule files declare their activation mode in
+// frontmatter; always_on matches the always-loaded legacy .windsurf file.
+const DEVIN_RULE_FRONTMATTER = '---\ntrigger: always_on\n---\n\n';
+
+// Devin Desktop loads .devin/rules/ and .windsurf/rules/ alike
+// (docs.devin.ai/cli/extensibility/rules), so there must be exactly one
+// mirror: a second copy would load twice and go stale. It stays under
+// .windsurf/ while that directory exists, in its legacy shape; a project
+// on .devin/ alone gets it there, with the trigger frontmatter. Mirrors
+// scripts/lib/propagate-state.js.
 function writeWindsurfContext(projectPath: string, block: string): string | null {
   const windsurfDir = path.join(projectPath, '.windsurf');
+  let toolDirName = '.devin';
   try {
-    if (!fs.existsSync(windsurfDir) || !fs.statSync(windsurfDir).isDirectory()) return null;
+    if (fs.existsSync(windsurfDir) && fs.statSync(windsurfDir).isDirectory()) toolDirName = '.windsurf';
+  } catch {
+    toolDirName = '.devin';
+  }
+  const toolDir = path.join(projectPath, toolDirName);
+  try {
+    if (!fs.existsSync(toolDir) || !fs.statSync(toolDir).isDirectory()) return null;
   } catch {
     return null;
   }
 
-  const rulesDir = path.join(windsurfDir, 'rules');
+  const rulesDir = path.join(toolDir, 'rules');
   const filePath = path.join(rulesDir, 'egc-context.md');
   if (!isPlainPathBelow(projectPath, filePath)) return null;
   fs.mkdirSync(rulesDir, { recursive: true });
 
   const existing = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf-8') : '';
-  fs.writeFileSync(filePath, upsertEgcSection(existing, block), 'utf-8');
+  const body = upsertEgcSection(existing, block);
+  const header = toolDirName === '.devin' && !existing ? DEVIN_RULE_FRONTMATTER : '';
+  fs.writeFileSync(filePath, header + body, 'utf-8');
   return filePath;
 }
 

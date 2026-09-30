@@ -20,6 +20,7 @@ const COMMIT_PRIVACY_FILES = [
   '.trae/rules/egc-context.md',
   '.github/copilot-instructions.md',
   '.windsurf/rules/egc-context.md',
+  '.devin/rules/egc-context.md',
   '.rules',
   '.clinerules',
   '.cursorrules',
@@ -478,7 +479,7 @@ function writeGeminiContext(projectPath, block, stateUpdated) {
 // tool's top-level dir (e.g. .windsurf/) rather than the target file itself,
 // and a rules/ subfolder is created under it on demand before the shared
 // egc-context.md is written there.
-function writeToolRulesContext(projectPath, toolDirName, block, stateUpdated) {
+function writeToolRulesContext(projectPath, toolDirName, block, stateUpdated, newFileHeader = '') {
   const toolDir = path.join(projectPath, toolDirName);
   try {
     if (!fs.existsSync(toolDir) || !fs.statSync(toolDir).isDirectory()) return null;
@@ -493,12 +494,34 @@ function writeToolRulesContext(projectPath, toolDirName, block, stateUpdated) {
 
   const existing = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf-8') : '';
   if (isStaleWrite(existing, stateUpdated, block)) return filePath;
-  fs.writeFileSync(filePath, upsertEgcSection(existing, block), 'utf-8');
+  const body = upsertEgcSection(existing, block);
+  fs.writeFileSync(filePath, existing ? body : newFileHeader + body, 'utf-8');
   return filePath;
 }
 
+// Devin Desktop workspace rule files declare their activation mode in
+// frontmatter; always_on matches what the legacy always-loaded .windsurf
+// rules file already did.
+const DEVIN_RULE_FRONTMATTER = '---\ntrigger: always_on\n---\n\n';
+
+// Devin Desktop loads .devin/rules/ and .windsurf/rules/ alike
+// (docs.devin.ai/cli/extensibility/rules), so there must be exactly one
+// mirror: a second copy would load twice and go stale. It stays under
+// .windsurf/ while that directory exists, in its legacy shape; a project
+// on .devin/ alone gets it there, with the trigger frontmatter.
+function isDirectorySafe(candidate) {
+  try {
+    return fs.statSync(candidate).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 function writeWindsurfContext(projectPath, block, stateUpdated) {
-  return writeToolRulesContext(projectPath, '.windsurf', block, stateUpdated);
+  if (isDirectorySafe(path.join(projectPath, '.windsurf'))) {
+    return writeToolRulesContext(projectPath, '.windsurf', block, stateUpdated);
+  }
+  return writeToolRulesContext(projectPath, '.devin', block, stateUpdated, DEVIN_RULE_FRONTMATTER);
 }
 
 function writeTraeContext(projectPath, block, stateUpdated) {

@@ -34,7 +34,15 @@ const TOOL_FILE_RESOLVERS = {
     return fs.existsSync(f) ? f : null;
   },
   windsurf: (p) => {
-    const f = path.join(p, '.windsurf', 'rules', 'egc-context.md');
+    // The one mirror propagate-state.js writes: under .windsurf/ while that
+    // directory exists, under .devin/ in a project on .devin/ alone.
+    let dir = '.devin';
+    try {
+      if (fs.statSync(path.join(p, '.windsurf')).isDirectory()) dir = '.windsurf';
+    } catch {
+      dir = '.devin';
+    }
+    const f = path.join(p, dir, 'rules', 'egc-context.md');
     return fs.existsSync(f) ? f : null;
   },
   trae: (p) => {
@@ -309,4 +317,4 @@ class StateWatcher {
   }
 }
 
-module.exports = { StateWatcher, extractEgcBlock, parseBlockToStateContent, mergeBlockIntoStateFile, resolveStateFilePath };
+module.exports = { StateWatcher, TOOL_FILE_RESOLVERS, extractEgcBlock, parseBlockToStateContent, mergeBlockIntoStateFile, resolveStateFilePath };
