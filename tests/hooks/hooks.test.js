@@ -257,14 +257,18 @@ function withPrependedPath(binDir, env = {}) {
 }
 
 function assertNoProjectDetectionSideEffects(homeDir, testName) {
-  const homunculusDir = path.join(homeDir, '.gemini', 'homunculus');
-  const registryPath = path.join(homunculusDir, 'projects.json');
-  const projectsDir = path.join(homunculusDir, 'projects');
+  // Checked under both the shared store and the legacy per-tool path: a
+  // writer that regresses to ~/.gemini/homunculus (the exact split this
+  // store fixes) must fail here too, not just leave the new path empty.
+  for (const base of [path.join(homeDir, '.egc-learning'), path.join(homeDir, '.gemini', 'homunculus')]) {
+    const registryPath = path.join(base, 'projects.json');
+    const projectsDir = path.join(base, 'projects');
 
-  assert.ok(!fs.existsSync(registryPath), `${testName} should not create projects.json`);
+    assert.ok(!fs.existsSync(registryPath), `${testName} should not create ${registryPath}`);
 
-  const projectEntries = fs.existsSync(projectsDir) ? fs.readdirSync(projectsDir).filter(entry => fs.statSync(path.join(projectsDir, entry)).isDirectory()) : [];
-  assert.strictEqual(projectEntries.length, 0, `${testName} should not create project directories`);
+    const projectEntries = fs.existsSync(projectsDir) ? fs.readdirSync(projectsDir).filter(entry => fs.statSync(path.join(projectsDir, entry)).isDirectory()) : [];
+    assert.strictEqual(projectEntries.length, 0, `${testName} should not create project directories under ${projectsDir}`);
+  }
 }
 
 async function assertObserveSkipBeforeProjectDetection(testCase) {
@@ -2397,11 +2401,10 @@ async function runTests() {
 
         const lines = stdout.trim().split(/\r?\n/).filter(Boolean);
         const [projectId, projectDir] = lines.slice(-2);
-        const registryPath = path.join(homeDir, '.gemini', 'homunculus', 'projects.json');
+        const registryPath = path.join(homeDir, '.egc-learning', 'projects.json');
         const expectedProjectDir = path.join(
           homeDir,
-          '.gemini',
-          'homunculus',
+          '.egc-learning',
           'projects',
           projectId
         );
@@ -2471,7 +2474,7 @@ async function runTests() {
 
         assert.strictEqual(result.code, 0, `observe.sh should exit successfully, stderr: ${result.stderr}`);
 
-        const projectsDir = path.join(homeDir, '.gemini', 'homunculus', 'projects');
+        const projectsDir = path.join(homeDir, '.egc-learning', 'projects');
         const projectIds = fs.readdirSync(projectsDir);
         assert.strictEqual(projectIds.length, 1, 'observe.sh should create one project-scoped observation directory');
 

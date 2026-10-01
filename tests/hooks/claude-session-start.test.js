@@ -5,6 +5,7 @@
 const assert = require('assert');
 const crypto = require('crypto');
 const fs = require('fs');
+const http = require('http');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
@@ -71,10 +72,12 @@ function encryptFixture(plaintext, key) {
 function runTests() {
   console.log('\n=== Testing claude-session-start.js hook ===\n');
 
-  let passed = 0;
-  let failed = 0;
+  const cases = [];
+  function addCase(name, fn) {
+    cases.push(() => test(name, fn));
+  }
 
-  if (test('prints the state file for the cwd received on stdin', () => {
+  addCase('prints the state file for the cwd received on stdin', () => {
     const homeDir = createTempDir('claude-session-start-home-');
     try {
       writeStateFile(homeDir, 'workspace--demo', '# Project State\n- resume feature X\n');
@@ -90,9 +93,9 @@ function runTests() {
     } finally {
       cleanup(homeDir);
     }
-  })) passed++; else failed++;
+  });
 
-  if (test('uses the same slug sanitization as the egc-memory server', () => {
+  addCase('uses the same slug sanitization as the egc-memory server', () => {
     const homeDir = createTempDir('claude-session-start-home-');
     try {
       writeStateFile(homeDir, 'My_Projects--app_v2_0', 'sanitized slug state\n');
@@ -107,9 +110,9 @@ function runTests() {
     } finally {
       cleanup(homeDir);
     }
-  })) passed++; else failed++;
+  });
 
-  if (test('exits silently with code 0 when no state file exists', () => {
+  addCase('exits silently with code 0 when no state file exists', () => {
     const homeDir = createTempDir('claude-session-start-home-');
     try {
       const result = runHook(homeDir, JSON.stringify({ cwd: '/workspace/empty' }));
@@ -119,9 +122,9 @@ function runTests() {
     } finally {
       cleanup(homeDir);
     }
-  })) passed++; else failed++;
+  });
 
-  if (test('exits silently with code 0 when the state file is blank', () => {
+  addCase('exits silently with code 0 when the state file is blank', () => {
     const homeDir = createTempDir('claude-session-start-home-');
     try {
       writeStateFile(homeDir, 'workspace-blank', '   \n\n');
@@ -133,9 +136,9 @@ function runTests() {
     } finally {
       cleanup(homeDir);
     }
-  })) passed++; else failed++;
+  });
 
-  if (test('tolerates invalid stdin and falls back to environment paths', () => {
+  addCase('tolerates invalid stdin and falls back to environment paths', () => {
     const homeDir = createTempDir('claude-session-start-home-');
     try {
       writeStateFile(homeDir, 'env--project', 'state from env fallback\n');
@@ -149,9 +152,9 @@ function runTests() {
     } finally {
       cleanup(homeDir);
     }
-  })) passed++; else failed++;
+  });
 
-  if (test('emits stack briefing for detectable project (JavaScript)', () => {
+  addCase('emits stack briefing for detectable project (JavaScript)', () => {
     const homeDir = createTempDir('claude-session-start-home-');
     const projectDir = createTempDir('claude-session-start-project-');
     try {
@@ -170,9 +173,9 @@ function runTests() {
       cleanup(homeDir);
       cleanup(projectDir);
     }
-  })) passed++; else failed++;
+  });
 
-  if (test('briefing and state are both printed when state exists', () => {
+  addCase('briefing and state are both printed when state exists', () => {
     const homeDir = createTempDir('claude-session-start-home-');
     const projectDir = createTempDir('claude-session-start-project-');
     try {
@@ -194,9 +197,9 @@ function runTests() {
       cleanup(homeDir);
       cleanup(projectDir);
     }
-  })) passed++; else failed++;
+  });
 
-  if (test('no briefing emitted for unrecognized project type', () => {
+  addCase('no briefing emitted for unrecognized project type', () => {
     const homeDir = createTempDir('claude-session-start-home-');
     try {
       const result = runHook(homeDir, JSON.stringify({ cwd: '/workspace/empty' }));
@@ -206,9 +209,9 @@ function runTests() {
     } finally {
       cleanup(homeDir);
     }
-  })) passed++; else failed++;
+  });
 
-  if (test('briefing shows install hint when agents directory is missing', () => {
+  addCase('briefing shows install hint when agents directory is missing', () => {
     const homeDir = createTempDir('claude-session-start-home-');
     const projectDir = createTempDir('claude-session-start-project-');
     try {
@@ -229,9 +232,9 @@ function runTests() {
       cleanup(homeDir);
       cleanup(projectDir);
     }
-  })) passed++; else failed++;
+  });
 
-  if (test('stays silent for encrypted state when no key exists', () => {
+  addCase('stays silent for encrypted state when no key exists', () => {
     const homeDir = createTempDir('claude-session-start-home-');
     try {
       const key = crypto.randomBytes(32);
@@ -244,9 +247,68 @@ function runTests() {
     } finally {
       cleanup(homeDir);
     }
-  })) passed++; else failed++;
+  });
 
-  if (test('prints decrypted state when the encryption key exists', () => {
+  addCase('migrates the legacy continuous-learning store on its first run', () => {
+    const homeDir = createTempDir('claude-session-start-home-');
+    try {
+      fs.mkdirSync(path.join(homeDir, '.gemini', 'homunculus', 'instincts', 'personal'), { recursive: true });
+      fs.writeFileSync(path.join(homeDir, '.gemini', 'homunculus', 'instincts', 'personal', 'a.yaml'), 'a');
+
+      const result = runHook(homeDir, JSON.stringify({ cwd: '/workspace/empty' }));
+
+      assert.strictEqual(result.code, 0);
+      assert.strictEqual(
+        fs.readFileSync(path.join(homeDir, '.egc-learning', 'instincts', 'personal', 'a.yaml'), 'utf8'),
+        'a',
+        'the native settings.json install path must migrate the store too, not only the plugin hooks.json path'
+      );
+    } finally {
+      cleanup(homeDir);
+    }
+  });
+
+  addCase('the installed hook migrates the store, so the install plan ships every dependency', () => {
+    const { planInstallTargetScaffold } = require('../../scripts/lib/install-targets/registry');
+    const repoRoot = path.join(__dirname, '..', '..');
+    const homeDir = createTempDir('claude-session-start-installed-');
+    try {
+      const plan = planInstallTargetScaffold({ target: 'claude', repoRoot, homeDir, modules: [] });
+      for (const operation of plan.operations) {
+        if (operation.kind !== 'copy-path') continue;
+        const source = path.join(repoRoot, operation.sourceRelativePath);
+        // A planned source that is gone fails here, loudly, instead of
+        // shipping an install that only this test's last assertion would miss.
+        assert.ok(fs.existsSync(source), `the install plan copies ${operation.sourceRelativePath}, which does not exist`);
+        fs.mkdirSync(path.dirname(operation.destinationPath), { recursive: true });
+        fs.cpSync(source, operation.destinationPath, { recursive: true, force: false, errorOnExist: true });
+      }
+      const installedHook = path.join(homeDir, '.claude', 'egc', 'hooks', 'claude-session-start.js');
+      assert.ok(fs.existsSync(installedHook), 'the install plan places the hook');
+
+      const legacy = path.join(homeDir, '.gemini', 'homunculus', 'instincts', 'personal');
+      fs.mkdirSync(legacy, { recursive: true });
+      fs.writeFileSync(path.join(legacy, 'a.yaml'), 'a');
+
+      const result = spawnSync(process.execPath, [installedHook], {
+        input: JSON.stringify({ cwd: '/workspace/empty' }),
+        encoding: 'utf8',
+        env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir, CLAUDE_PROJECT_DIR: '', PWD: '' },
+        timeout: 10000,
+      });
+
+      assert.strictEqual(result.status, 0, `status ${result.status}, signal ${result.signal}, error ${result.error}, stderr ${result.stderr}`);
+      assert.strictEqual(
+        fs.readFileSync(path.join(homeDir, '.egc-learning', 'instincts', 'personal', 'a.yaml'), 'utf8'),
+        'a',
+        'a dependency missing from the install plan would make the adapter fall back to a silent no-op'
+      );
+    } finally {
+      cleanup(homeDir);
+    }
+  });
+
+  addCase('prints decrypted state when the encryption key exists', () => {
     const homeDir = createTempDir('claude-session-start-home-');
     try {
       const key = crypto.randomBytes(32);
@@ -268,10 +330,26 @@ function runTests() {
     } finally {
       cleanup(homeDir);
     }
-  })) passed++; else failed++;
+  });
+
+  let passed = 0;
+  let failed = 0;
+  for (const run of cases) {
+    if (run()) passed++; else failed++;
+  }
 
   console.log(`\nResults: Passed: ${passed}, Failed: ${failed}`);
   process.exit(failed > 0 ? 1 : 0);
 }
 
-runTests();
+// Every hook these cases run posts a session_start event to the Dashboard;
+// a listener owned by this run receives it, so a developer's running
+// Dashboard on the default port never sees test traffic.
+const dashboard = http.createServer((request, response) => {
+  request.resume();
+  response.writeHead(204).end();
+});
+dashboard.listen(0, '127.0.0.1', () => {
+  process.env.EGC_PORT = String(dashboard.address().port);
+  runTests();
+});

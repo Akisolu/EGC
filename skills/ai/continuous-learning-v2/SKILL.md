@@ -132,7 +132,7 @@ The system automatically detects your current project:
 3. **`git rev-parse --show-toplevel`** -- fallback using repo path (machine-specific)
 4. **Global fallback** -- if no project is detected, instincts go to global scope
 
-Each project gets a 12-character hash ID (e.g., `a1b2c3d4e5f6`). A registry file at `~/.gemini/homunculus/projects.json` maps IDs to human-readable names.
+Each project gets a 12-character hash ID (e.g., `a1b2c3d4e5f6`). A registry file at `~/.egc-learning/projects.json` maps IDs to human-readable names.
 
 ## Quick Start
 
@@ -173,7 +173,7 @@ The system creates directories automatically on first use, but you can also crea
 
 ```bash
 # Global directories
-mkdir -p ~/.gemini/homunculus/{instincts/{personal,inherited},evolved/{agents,skills,commands},projects}
+mkdir -p ~/.egc-learning/{instincts/{personal,inherited},evolved/{agents,skills,commands},projects}
 
 # Project directories are auto-created when the hook first runs in a git repo
 ```
@@ -226,7 +226,7 @@ Other behavior (observation capture, instinct thresholds, project scoping, promo
 ## File Structure
 
 ```
-~/.gemini/homunculus/
+~/.egc-learning/
 +-- identity.json           # Your profile, technical level
 +-- projects.json           # Registry: project hash -> name/path/remote
 +-- observations.jsonl      # Global observations (fallback)
@@ -322,10 +322,10 @@ Hooks fire **100% of the time**, deterministically. This means:
 ## Backward Compatibility
 
 v2.1 is fully compatible with v2.0 and v1:
-- Existing global instincts in `~/.gemini/homunculus/instincts/` still work as global instincts
+- Global instincts kept in `~/.gemini/homunculus/instincts/` (or any other tool's own `homunculus/` folder) by earlier versions are copied into `~/.egc-learning/instincts/` once, at the first session start after the upgrade, and still work as global instincts
+- The copy is one-time and marker-gated: anything written to the old folder after that first copy is never picked up again, so every tool should move to the new store rather than keep writing the old one
 - Existing `~/.gemini/skills/learned/` skills from v1 still work
 - Stop hook still runs (but now also feeds into v2)
-- Gradual migration: run both in parallel
 
 ## Privacy
 

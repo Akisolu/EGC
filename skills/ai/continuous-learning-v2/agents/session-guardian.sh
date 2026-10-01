@@ -5,7 +5,7 @@
 #
 # Config (env vars, all optional):
 #   OBSERVER_INTERVAL_SECONDS    default: 300   (per-project cooldown)
-#   OBSERVER_LAST_RUN_LOG        default: ~/.gemini/observer-last-run.log
+#   OBSERVER_LAST_RUN_LOG        default: ~/.egc-learning/observer-last-run.log
 #   OBSERVER_ACTIVE_HOURS_START  default: 800   (8:00 AM local, set to 0 to disable)
 #   OBSERVER_ACTIVE_HOURS_END    default: 2300  (11:00 PM local, set to 0 to disable)
 #   OBSERVER_MAX_IDLE_SECONDS    default: 1800  (30 min; set to 0 to disable)
@@ -18,7 +18,7 @@
 set -euo pipefail
 
 INTERVAL="${OBSERVER_INTERVAL_SECONDS:-300}"
-LOG_PATH="${OBSERVER_LAST_RUN_LOG:-$HOME/.gemini/observer-last-run.log}"
+LOG_PATH="${OBSERVER_LAST_RUN_LOG:-${HOME:-$USERPROFILE}/.egc-learning/observer-last-run.log}"
 ACTIVE_START="${OBSERVER_ACTIVE_HOURS_START:-800}"
 ACTIVE_END="${OBSERVER_ACTIVE_HOURS_END:-2300}"
 MAX_IDLE="${OBSERVER_MAX_IDLE_SECONDS:-1800}"
@@ -68,6 +68,14 @@ mkdir -p "$(dirname "$LOG_PATH")" || {
   echo "session-guardian: cannot create log dir, proceeding" >&2
   exit 0
 }
+
+# The shell observer always wrote cooldown state to this path before the
+# shared store existed; seed the new log from it once so projects do not
+# all read last_spawn=0 after the upgrade and burst past Gate 2.
+_legacy_log_path="${HOME:-$USERPROFILE}/.gemini/observer-last-run.log"
+if [ ! -f "$LOG_PATH" ] && [ -f "$_legacy_log_path" ]; then
+  cp "$_legacy_log_path" "$LOG_PATH" 2>/dev/null || true
+fi
 
 _lock_dir="${LOG_PATH}.lock"
 if ! mkdir "$_lock_dir" 2>/dev/null; then
