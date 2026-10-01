@@ -310,6 +310,7 @@ function runPatchedRunAll(tempRoot) {
   const tempTestsDir = path.join(tempRoot, 'tests');
   let source = fs.readFileSync(path.join(__dirname, '..', 'run-all.js'), 'utf8');
   source = source.replace('const testsDir = __dirname;', `const testsDir = ${JSON.stringify(tempTestsDir)};`);
+  source = source.replace("require('./fixtures/harness-variables')", `require(${JSON.stringify(path.join(__dirname, '..', 'fixtures', 'harness-variables'))})`);
   fs.writeFileSync(wrapperPath, source);
 
   const result = spawnSync('node', [wrapperPath], {
@@ -1937,8 +1938,8 @@ async function runTests() {
       const bootstrapSrc = fs.readFileSync(bootstrapPath, 'utf8');
       assert.ok(bootstrapSrc.includes('session:start'), 'Bootstrap should invoke the session:start profile');
       assert.ok(bootstrapSrc.includes('run-with-flags.js'), 'Bootstrap should resolve the runner script');
-      assert.ok(bootstrapSrc.includes('GEMINI_PLUGIN_ROOT'), 'Bootstrap should consult GEMINI_PLUGIN_ROOT');
-      assert.ok(bootstrapSrc.includes('plugins'), 'Bootstrap should probe known plugin roots');
+      assert.ok(bootstrapSrc.includes("path.resolve(__dirname, '..', '..')"), 'Bootstrap should run the runner of the EGC root it lives in');
+      assert.ok(!bootstrapSrc.includes("'.gemini'"), 'Bootstrap should not search the retired Gemini CLI home');
     }));
   tally(test('Stop and SessionEnd hooks use the safe inline resolver when plugin root may be unset', () => {
       const hooksPath = path.join(__dirname, '..', '..', 'hooks', 'hooks.json');
@@ -2294,9 +2295,9 @@ async function runTests() {
 
   console.log('\nShell wrapper portability:');
 
-  tally(test('run-with-flags-shell resolves plugin root when GEMINI_PLUGIN_ROOT is unset', () => {
+  tally(test('run-with-flags-shell resolves plugin root from EGC_PLUGIN_ROOT or ECC_PLUGIN_ROOT, then its own script path', () => {
       const wrapperSource = fs.readFileSync(path.join(scriptsDir, 'run-with-flags-shell.sh'), 'utf8');
-      assert.ok(wrapperSource.includes('PLUGIN_ROOT="${GEMINI_PLUGIN_ROOT:-'), 'Shell wrapper should derive PLUGIN_ROOT from its own script path');
+      assert.ok(wrapperSource.includes('PLUGIN_ROOT="${EGC_PLUGIN_ROOT:-${ECC_PLUGIN_ROOT:-${GEMINI_PLUGIN_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}}}"'),'Shell wrapper should read the root EGC runners pass, then derive it from its own script path');
     }));
 
   tally(test('continuous-learning shell scripts use resolved Python command instead of hardcoded python3 invocations', () => {
